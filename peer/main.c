@@ -384,9 +384,33 @@ static int cmd_get(const char *tracker_host, const char *tracker_port, const cha
 
     if (query(&j, tracker_host, tracker_port) != 0) { t_log("peer", "GET: query failed"); return -1; }
 
-    FILE *out = fopen(outpath, "wb+");
+    // NEW: resume support
+    struct stat st;
+    int exists = (stat(outpath, &st) == 0);
+
+    FILE *out = fopen(outpath, exists ? "rb+" : "wb+");
     if (!out) return -1;
+
+    // Ensure file is at least j.size for random-access writes (best-effort)
     if (ftruncate(fileno(out), (off_t)j.size) != 0) { /* best-effort */ }
+
+    // If we already had bytes on disk, mark corresponding chunks as present (full chunks only)
+    if (exists) {
+        size_t have_size = (size_t)st.st_size;
+        if (have_size > j.size) have_size = j.size;
+
+        size_t have_chunks = 0;
+        if (j.chunk_size) {
+            have_chunks = have_size / j.chunk_size;
+            if ((have_size % j.chunk_size) != 0) have_chunks += 1; // if you want to treat partial last chunk as present
+        }
+
+        pthread_mutex_lock(&j.mu);
+        for (size_t i = 0; i < have_chunks && i < j.nchunks; i++) t_bitmap_set(j.have, i);
+        pthread_mutex_unlock(&j.mu);
+
+        t_log("peer", "GET resume: already_have_bytes=%zu already_have_chunks=%zu", have_size, have_chunks);
+    }
 
     pthread_t th[WORKERS];
     worker_arg wa[WORKERS];
