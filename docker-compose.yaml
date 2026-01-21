@@ -24,7 +24,6 @@ services:
       - LISTEN_PORT=10001
       - DATA_DIR=/data
       - PYTHONUNBUFFERED=1
-      - SEED_FILE=example.bin
     volumes:
       - ./_data/peer1:/data
     networks: [psinet]

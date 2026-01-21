@@ -6,10 +6,10 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#include <sys/types.h>   // for off_t
-#include <sys/stat.h>    // for ftruncate (some libcs)
-#include <fcntl.h>       // may be needed on some setups
-#include <time.h>        // add for simple randomization
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <time.h>
 
 #define BACKLOG 16
 #define MAX_PEERS 64
@@ -70,8 +70,11 @@ static int buildBitfieldForLocalFile(const char *path, size_t totalSizeBytes, si
 
     size_t haveChunks = 0;
     if (chunkSizeBytes) {
-        haveChunks = haveSizeBytes / chunkSizeBytes;
-        if ((haveSizeBytes % chunkSizeBytes) != 0) haveChunks += 1;
+        if (haveSizeBytes == totalSizeBytes) {
+            haveChunks = (totalSizeBytes + chunkSizeBytes - 1) / chunkSizeBytes;
+        } else {
+            haveChunks = haveSizeBytes / chunkSizeBytes; // floor: excludes partial chunk
+        }
     }
 
     for (size_t i = 0; i < haveChunks; i++) tBitmapSet(outBitfield, i);
@@ -440,8 +443,11 @@ static int cmdGet(const char *trackerHost, const char *trackerPort, const char *
 
         size_t haveChunks = 0;
         if (job.chunkSizeBytes) {
-            haveChunks = haveSizeBytes / job.chunkSizeBytes;
-            if ((haveSizeBytes % job.chunkSizeBytes) != 0) haveChunks += 1;
+            if (haveSizeBytes == job.totalSizeBytes) {
+                haveChunks = job.chunkCount;
+            } else {
+                haveChunks = haveSizeBytes / job.chunkSizeBytes; // floor: excludes partial chunk
+            }
         }
 
         pthread_mutex_lock(&job.mutex);
