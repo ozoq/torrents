@@ -1,5 +1,3 @@
-version: "3.0"
-
 services:
   tracker:
     image: z78_tracker
@@ -11,6 +9,7 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
     networks: [z78_network]
+    pull_policy: never
 
   peer1:
     image: z78_peer1
@@ -30,6 +29,7 @@ services:
       - ./_data/peer1:/data
     networks: [z78_network]
     depends_on: [tracker]
+    pull_policy: never
 
   peer2:
     image: z78_peer2
@@ -49,6 +49,7 @@ services:
       - ./_data/peer2:/data
     networks: [z78_network]
     depends_on: [tracker]
+    pull_policy: never
 
   peer3:
     image: z78_peer3
@@ -68,6 +69,7 @@ services:
       - ./_data/peer3:/data
     networks: [z78_network]
     depends_on: [tracker]
+    pull_policy: never
 
 networks:
   z78_network:
