@@ -88,13 +88,13 @@ testHappyPathSingleSeed() {
   buildImages
   upBase
 
-  dockerExec t_peer1 sh -lc "/app/tpeer seed example.bin 1048576" >/dev/null
+  dockerExec z78_peer1 sh -lc "/app/tpeer seed example.bin 1048576" >/dev/null
   sleep 1
 
-  dockerExec t_peer3 sh -lc "/app/tpeer get example.bin /data/out.bin" >/dev/null || fail "download failed"
+  dockerExec z78_peer3 sh -lc "/app/tpeer get example.bin /data/out.bin" >/dev/null || fail "download failed"
 
-  dockerExec t_peer3 sh -lc "test \$(stat -c%s /data/out.bin) -eq 1048576" || fail "out size mismatch"
-  assertFileHashEquals t_peer1 /data/example.bin t_peer3 /data/out.bin
+  dockerExec z78_peer3 sh -lc "test \$(stat -c%s /data/out.bin) -eq 1048576" || fail "out size mismatch"
+  assertFileHashEquals z78_peer1 /data/example.bin z78_peer3 /data/out.bin
 
   echo "testHappyPathSingleSeed OK"
 }
@@ -106,14 +106,14 @@ testHappyPathMultiSeed() {
   buildImages
   upBase
 
-  dockerExec t_peer1 sh -lc "/app/tpeer seed example.bin 1048576" >/dev/null
-  dockerExec t_peer2 sh -lc "/app/tpeer seed example.bin 1048576" >/dev/null
+  dockerExec z78_peer1 sh -lc "/app/tpeer seed example.bin 1048576" >/dev/null
+  dockerExec z78_peer2 sh -lc "/app/tpeer seed example.bin 1048576" >/dev/null
   sleep 1
 
-  dockerExec t_peer3 sh -lc "/app/tpeer get example.bin /data/out.bin" >/dev/null || fail "download failed"
+  dockerExec z78_peer3 sh -lc "/app/tpeer get example.bin /data/out.bin" >/dev/null || fail "download failed"
 
-  dockerExec t_peer3 sh -lc "test \$(stat -c%s /data/out.bin) -eq 1048576" || fail "out size mismatch"
-  assertFileHashEquals t_peer1 /data/example.bin t_peer3 /data/out.bin
+  dockerExec z78_peer3 sh -lc "test \$(stat -c%s /data/out.bin) -eq 1048576" || fail "out size mismatch"
+  assertFileHashEquals z78_peer1 /data/example.bin z78_peer3 /data/out.bin
 
   echo "testHappyPathMultiSeed OK"
 }
@@ -121,16 +121,15 @@ testHappyPathMultiSeed() {
 testMetaMismatch() {
   echo "== testMetaMismatch =="
   cleanAll
-  ensureNetwork
   prepareData multiSeed 400000
   buildImages
   upBase
 
-  dockerExec t_peer1 sh -lc "/app/tpeer seed example.bin 1048576" >/dev/null
-  dockerExec t_peer2 sh -lc "/app/tpeer seed example.bin 999999" >/dev/null 2>&1 || true
+  dockerExec z78_peer1 sh -lc "/app/tpeer seed example.bin 1048576" >/dev/null
+  dockerExec z78_peer2 sh -lc "/app/tpeer seed example.bin 999999" >/dev/null 2>&1 || true
 
   mkdir -p "$ROOT_DIR/tests/_logs"
-  logsToFile t_tracker "$ROOT_DIR/tests/_logs/tracker_metaMismatch.log"
+  logsToFile z78_tracker "$ROOT_DIR/tests/_logs/tracker_metaMismatch.log"
 
   grep -q "meta mismatch" "$ROOT_DIR/tests/_logs/tracker_metaMismatch.log" || fail "expected meta mismatch log not found"
   echo "testMetaMismatch OK"
@@ -139,7 +138,6 @@ testMetaMismatch() {
 testBadBitmap() {
   echo "== testBadBitmap =="
   cleanAll
-  ensureNetwork
   prepareData singleSeed 0
   buildImages
   upBase
@@ -147,11 +145,11 @@ testBadBitmap() {
   # use a small netcat container on same network and send a broken ANNOUNCE (bitmap length wrong)
   docker run --rm --network z78_network alpine:3.19 sh -lc "
     apk add --no-cache netcat-openbsd >/dev/null
-    printf 'ANNOUNCE 5555 example.bin 1048576 1048576 4096 deadbeef\n' | nc -w 2 t_tracker 9000
+    printf 'ANNOUNCE 5555 example.bin 1048576 1048576 4096 deadbeef\n' | nc -w 2 z78_tracker 9000
   " > "$ROOT_DIR/tests/_badBitmap.out" 2>&1 || true
 
   mkdir -p "$ROOT_DIR/tests/_logs"
-  logsToFile t_tracker "$ROOT_DIR/tests/_logs/tracker_badBitmap.log"
+  logsToFile z78_tracker "$ROOT_DIR/tests/_logs/tracker_badBitmap.log"
 
   grep -q "ERR bad_bitmap" "$ROOT_DIR/tests/_badBitmap.out" || fail "expected ERR bad_bitmap reply not found"
   echo "testBadBitmap OK"
@@ -160,7 +158,6 @@ testBadBitmap() {
 testMissingChunk() {
   echo "== testMissingChunk =="
   cleanAll
-  ensureNetwork
 
   # only 1 byte existing, so only chunk 0 is "have"
   # many chunks will be missing for all peers
@@ -169,12 +166,12 @@ testMissingChunk() {
   buildImages
   upBase
 
-  dockerExec t_peer1 sh -lc "/app/tpeer seed example.bin 1048576" >/dev/null
-  dockerExec t_peer2 sh -lc "/app/tpeer seed example.bin 1048576" >/dev/null
+  dockerExec z78_peer1 sh -lc "/app/tpeer seed example.bin 1048576" >/dev/null
+  dockerExec z78_peer2 sh -lc "/app/tpeer seed example.bin 1048576" >/dev/null
   sleep 1
 
   local outLog="$ROOT_DIR/tests/_logs/peer3_missingChunk.log"
-  if runGetCapture "$outLog" t_peer3 example.bin /data/out.bin; then
+  if runGetCapture "$outLog" z78_peer3 example.bin /data/out.bin; then
     fail "expected download to fail"
   fi
 
@@ -185,42 +182,40 @@ testMissingChunk() {
 testResumeDownload() {
   echo "== testResumeDownload =="
   cleanAll
-  ensureNetwork
   prepareData multiSeed 400000
   buildImages
   upBase
 
-  dockerExec t_peer1 sh -lc "/app/tpeer seed example.bin 1048576" >/dev/null
-  dockerExec t_peer2 sh -lc "/app/tpeer seed example.bin 1048576" >/dev/null
+  dockerExec z78_peer1 sh -lc "/app/tpeer seed example.bin 1048576" >/dev/null
+  dockerExec z78_peer2 sh -lc "/app/tpeer seed example.bin 1048576" >/dev/null
   sleep 1
 
   mkdir -p "$ROOT_DIR/tests/_tmp"
-  docker cp t_peer1:/data/example.bin "$ROOT_DIR/tests/_tmp/example.bin"
-  docker cp "$ROOT_DIR/tests/_tmp/example.bin" t_peer3:/data/example.bin
+  docker cp z78_peer1:/data/example.bin "$ROOT_DIR/tests/_tmp/example.bin"
+  docker cp "$ROOT_DIR/tests/_tmp/example.bin" z78_peer3:/data/example.bin
   rm -f "$ROOT_DIR/tests/_tmp/example.bin"
 
-  dockerExec t_peer3 sh -lc "rm -f /data/out.bin"
-  dockerExec t_peer3 sh -lc "dd if=/data/example.bin of=/data/out.bin bs=1 count=200000 status=none" >/dev/null
+  dockerExec z78_peer3 sh -lc "rm -f /data/out.bin"
+  dockerExec z78_peer3 sh -lc "dd if=/data/example.bin of=/data/out.bin bs=1 count=200000 status=none" >/dev/null
 
   local outLog="$ROOT_DIR/tests/_logs/peer3_resume.log"
-  runGetCapture "$outLog" t_peer3 example.bin /data/out.bin || fail "resume download failed"
+  runGetCapture "$outLog" z78_peer3 example.bin /data/out.bin || fail "resume download failed"
 
   grep -q "GET resume" "$outLog" || fail "expected resume log not found"
-  dockerExec t_peer3 sh -lc "test \$(stat -c%s /data/out.bin) -eq 1048576" || fail "out size mismatch"
-  assertFileHashEquals t_peer1 /data/example.bin t_peer3 /data/out.bin
+  dockerExec z78_peer3 sh -lc "test \$(stat -c%s /data/out.bin) -eq 1048576" || fail "out size mismatch"
+  assertFileHashEquals z78_peer1 /data/example.bin z78_peer3 /data/out.bin
   echo "testResumeDownload OK"
 }
 
 testBadDataSizeFromSeed() {
   echo "== testBadDataSizeFromSeed =="
   cleanAll
-  ensureNetwork
   prepareData singleSeed 0
   buildImages
   upBase
 
   # start fake seed server as separate container on z78_network
-  docker run -d --rm --name t_fake_seed --network z78_network \
+  docker run -d --rm --name z78_fake_seed --network z78_network \
     -v "$ROOT_DIR/tests:/tests:ro" python:3.11-alpine \
     python /tests/fake-seed.py 10009 >/dev/null
 
@@ -231,20 +226,20 @@ testBadDataSizeFromSeed() {
     printf 'ANNOUNCE 10009 example.bin 1048576 1048576 4096 ' > /tmp/a
     # bitmap bytes for 1048576/4096=256 chunks => 32 bytes => 64 hex chars
     printf 'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\n' >> /tmp/a
-    cat /tmp/a | nc -w 2 t_tracker 9000
+    cat /tmp/a | nc -w 2 z78_tracker 9000
   " >/dev/null 2>&1 || true
 
   # also announce real seed so download can still finish
-  dockerExec t_peer1 sh -lc "/app/tpeer seed example.bin 1048576" >/dev/null
+  dockerExec z78_peer1 sh -lc "/app/tpeer seed example.bin 1048576" >/dev/null
   sleep 1
 
-  dockerExec t_peer3 sh -lc "/app/tpeer get example.bin /data/out.bin" >/dev/null || fail "download failed"
+  dockerExec z78_peer3 sh -lc "/app/tpeer get example.bin /data/out.bin" >/dev/null || fail "download failed"
 
   # stop fake seed
-  docker rm -f t_fake_seed >/dev/null 2>&1 || true
+  docker rm -f z78_fake_seed >/dev/null 2>&1 || true
 
-  dockerExec t_peer3 sh -lc "test \$(stat -c%s /data/out.bin) -eq 1048576" || fail "out size mismatch"
-  assertFileHashEquals t_peer1 /data/example.bin t_peer3 /data/out.bin
+  dockerExec z78_peer3 sh -lc "test \$(stat -c%s /data/out.bin) -eq 1048576" || fail "out size mismatch"
+  assertFileHashEquals z78_peer1 /data/example.bin z78_peer3 /data/out.bin
 
   echo "testBadDataSizeFromSeed OK"
 }
@@ -252,13 +247,12 @@ testBadDataSizeFromSeed() {
 testNotFoundQuery() {
   echo "== testNotFoundQuery =="
   cleanAll
-  ensureNetwork
   prepareData multiSeed 400000
   buildImages
   upBase
 
   local outLog="$ROOT_DIR/tests/_logs/peer3_notFound.log"
-  if runGetCapture "$outLog" t_peer3 missing.bin /data/out.bin; then
+  if runGetCapture "$outLog" z78_peer3 missing.bin /data/out.bin; then
     fail "expected get to fail for missing file"
   fi
 

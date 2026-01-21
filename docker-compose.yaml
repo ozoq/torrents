@@ -2,7 +2,7 @@ version: "3.0"
 
 services:
   tracker:
-    container_name: t_tracker
+    container_name: z78_tracker
     build:
       context: .
       dockerfile: ./tracker/dockerfile
@@ -12,14 +12,14 @@ services:
     networks: [z78_network]
 
   peer1:
-    container_name: t_peer1
+    container_name: z78_peer1
     build:
       context: .
       dockerfile: ./peer/dockerfile
     tty: false
     environment:
       - PEER_NAME=peer1
-      - TRACKER_HOST=t_tracker
+      - TRACKER_HOST=z78_tracker
       - TRACKER_PORT=9000
       - LISTEN_PORT=10001
       - DATA_DIR=/data
@@ -30,14 +30,14 @@ services:
     depends_on: [tracker]
 
   peer2:
-    container_name: t_peer2
+    container_name: z78_peer2
     build:
       context: .
       dockerfile: ./peer/dockerfile
     tty: false
     environment:
       - PEER_NAME=peer2
-      - TRACKER_HOST=t_tracker
+      - TRACKER_HOST=z78_tracker
       - TRACKER_PORT=9000
       - LISTEN_PORT=10002
       - DATA_DIR=/data
@@ -48,14 +48,14 @@ services:
     depends_on: [tracker]
 
   peer3:
-    container_name: t_peer3
+    container_name: z78_peer3
     build:
       context: .
       dockerfile: ./peer/dockerfile
     tty: false
     environment:
       - PEER_NAME=peer3
-      - TRACKER_HOST=t_tracker
+      - TRACKER_HOST=z78_tracker
       - TRACKER_PORT=9000
       - LISTEN_PORT=10003
       - DATA_DIR=/data
