@@ -1,0 +1,832 @@
+Uruchamianie programów sieciowych w kontenerach
+ G.Blinowski II PW; grzegorz.blinowski@ii.pw.edu.pl; ostatnia aktualizacja: 03.11.2023
+1. Wstęp – kontenery czy wirtualizacja?
+Kontenery są bardzo przydatnym mechanizmem systemu operacyjnego, pozwalającym na uruchamianie programów w
+odpowiednio „spreparowanych” i odizolowanych wzajemnie środowiskach. Dalej skupimy się wyłącznie na
+kontenerach w systemie Linux. Linux (i każda odmiana Unixa) zapewnia oczywiście separację procesów. Oznacza to,
+że procesy nie mogą np. pisać wzajemnie po swojej pamięci, a dostęp do wspólnych zasobów (takich jak pliki i
+urządzenia) jest ściśle kontrolowany. Procesy jednak współdzielą wiele zasobów, i choć system operacyjny pilnuje, aby
+dostęp do nich odbywał się wg. ściśle określonych reguł, to procesy zazwyczaj „widzą” te same wspólne zasoby i
+pośrednio rywalizują w dostępie do nich.
+Oto kilka przykładów:
+• Drzewo procesów – przestrzeń nazw PID (process ID) – każdy proces posiada dostęp do globalnej tablicy
+deskryptorów i jest „świadomy” podstawowych parametrów pracy innych procesów (np. ich PID i PPID,
+zajmowanej pamięci, stanu, i wielu innych).
+• System plików – podstawowa przestrzeń nazw w każdym systemie Unix-owym. Mechanizm praw dostępu
+zapobiega nieuprawionym dostępom (np. użytkownicy nie mogą zapisywać ani usuwać plików systemowych),
+jednak współdzielenie przez wszystkie procesy jednego wspólnego drzewa plików nastręcza pewnych
+problemów. Przykładem jest np. konfiguracja plików bibliotek programistycznych – różne programy mogą
+wymagać różnych ich wersji. Zapewnienie takiego wymagania jest możliwe, jednak w miarę jak liczba
+rodzajów, wersji i wzajemnych zależności różnych bibliotek rośnie, staje się coraz bardziej kłopotliwe.
+• Podstawowe zasoby sprzętowe – procesory (rdzenie) i pamięć RAM – systemy Unix-owe bardzo dobrze
+radzą sobie ze sprawiedliwym przydziałem procesorów oraz pamięci do procesów. Jednak pochodzą one ze
+wspólnej puli, często zaś chcielibyśmy ograniczyć przydział tych zasobów dla konkretnego programu,
+alokując np. 2 z 4 dostępnych rdzeni CPU.
+• Zasoby sieciowe – tutaj, podobnie jak w poprzednim punkcie jądro systemu dba, aby wiele procesów na
+takich samych (uczciwych!) zasadach mogło korzystać z interfejsu sieciowego i dostępnych stosów
+protokołów. Specyfika programowania sieciowego powoduje jednak, że bardzo często chcielibyśmy mieć przy
+najmniej „złudzenie” wyłączności dla zasobów sieciowych. Dlaczego? W przypadku bardziej
+zaawansowanych programów, a zwłaszcza serwerów sieciowych, programista chciałby w pełni zapanować nad
+środowiskiem, w tym np. nad adresem IP i maską, czy pulą dostępnych portów sieciowych – bez uprawnień
+administratora nie jest to możliwe.
+Skoro pełną separację zasobów zapewnia system operacyjny, to możemy zadać dość oczywiste pytanie – czy w
+sytuacji, gdy wymagana jest większa od standardowej separacja zasobów, nie należy po prostu skorzystać z
+mechanizmu wirtualizacji*, tworząc dla programów o specyficznych wymaganiach własne, wirtualne wersje systemu
+operacyjnego? Jest to w wielu przypadkach optymalne rozwiązanie, z którego bardzo często się korzysta. Ma ono
+jednak pewne wady – oto one:
+• Stworzenie maszyny wirtualnej jest kosztowne w sensie sprzętowym – wymaga ona odpowiedniej platformy --
+systemu gospodarza (host) lub dedykowanego hipervisora, to z kolei pociąga za sobą konieczność planowania
+i alokacji zasobów: CPU, pamięci, miejsca na dysku.
+• Eksploatacja (kolejnej kopii) systemu operacyjnego jest kosztowana w sensie „osobowym” – wymaga narzutu
+administracyjnego – należy system aktualizować, monitorować logi, dbać, aby nie zabrakło miejsca w
+systemach plików, itd.
+• Eksploatacja maszyny wirtualnej jest kosztowna w sensie czasu i zużytej energii. Maszyna wirtualna z własną
+kopią systemu operacyjnego jest „ciężka” – stwarza dodatkowy narzut związany z działaniem jądra systemu,
+procesów systemowych, itd.
+Tak więc, maszyny wirtualne, choć faktycznie zapewniają na tej samej platformie sprzętowej maksymalną izolację
+środowisk pracy dla programów, to są jednocześnie stosunkowo „ciężkie” pod względem: konfiguracji, administracji i
+eksploatacji. Lżejszą alternatywą (jak można się było domyśleć) są kontenery. Kontenery zapewniają procesom
+dodatkową warstwę wzajemnej izolacji, w obrębie tej samej kopii systemu operacyjnego, a więc tego samego jądra
+systemu. Oto niektóre efekty konteneryzacji, których może doświadczyć proces (lub grupa procesów):
+• Własna hierarchia plików, poczynając od korzenia (tj. katalogu root – „/”)
+• Własna hierarchia PID-ów – pierwszy uruchomiony w kontenerze proces otrzymuje PID o wartości 1.
+• Własny stos sieciowy (IPv4 / IPv6) – użytkownik sam określa adres, maskę sieciową, adresy bramy oraz
+serwerów DNS, itd.
+Ponieważ opisana wyżej izolacja odbywa się dla wszystkich procesów w ramach tego samego jądra systemu, to jest ona
+w pewnym sensie „iluzoryczna” i sprowadza się do manipulacji przez jądro widocznością zasobów dla poszczególnych
+procesów. Najprościej wytłumaczyć różnicę pomiędzy kontenerem, a maszyną wirtualną, odwołując się do hierarchii
+plików:
+• W każdej maszynie wirtualnej jądro przeprowadza montowanie systemu plików (co najmniej jednego, często
+większej ich liczby). Systemy plików poszczególnych maszyn wirtualnych są rozdzielone, posiadają własny:
+superblok, tablicę metryczek, listę wolnych bloków, katalog „/”, itd. Mogą znajdować się na różnych fizycznie
+dyskach lub partycjach dyskowych, a przynajmniej zlokalizowane są w odrębnych plikach systemu
+gospodarza.
+• Procesy zgrupowane w kontenerze także „widzą” zamontowany własny (i prywatny dla danego kontenera)
+system plików. W rzeczywistości jest on tylko podkatalogiem drzewa plików systemu operacyjnego.
+Katalogiem odpowiednie spreparowanym – posiada np. podkatalogi „/etc”, „/dev”, „/bin”, itd. Pliki danego
+kontenera nie będą też dostępne w innych kontenerach. Procesy w kontenerze nie mogą też „wyjść” poza swój
+własny korzeń systemu plików. Nie zmienia to jednak faktu, że kontenery w danym systemie współdzielą to
+samo, ogólno-systemowe drzewo plików.
+Podobnie jest z PID-ami – w każdym systemie wirtualnym jądro utrzymuje własną hierarchię identyfikatorów
+procesów. W środowisku kontenerowym jądro także posiada jedną hierarchę PID, jednak gdy skonteneryzowany proces
+pyta o PID (lub listę wszystkich PID-ów) otrzymuje specjalny spreparowany na potrzeby danego kontenera podzbiór
+identyfikatorów procesów ze zmienionymi wartościami.
+Dodatkowa informacja – bazowe mechanizmy konteneryzacji
+Nie będziemy tu opisywać mechanizmów systemowych wykorzystywanych przez środowiska kontenerowe,
+gdyż dotykają one do dość zaawansowanych aspektów architektury systemu. Warto jednak wspomnieć, że
+wszystkie rozwiązania kontenerowe dostępne w Linuxie wykorzystują następujące bazowe mechanizmy jądra:
+• grupy kontrolne (ang.: control groups, lub cgroups),
+• przestrzenie nazw (namespaces),
+• wywołanie systemowe chroot(), trwale zmieniające korzeń systemu plików widoczny dla danego
+procesu (i jego potomków)
+• nakładkowanie systemów plików (wirtualny system plików typu overlay, nazywany też unionfs).
+Grupy kontrolne zapewniają izolację zasobów, a przestrzenie nazw realizują ograniczenie ich widoczności.
+Nakładkowanie systemu plików pozwala uniknąć kopiowania całej hierarchii dyskowej do kolejnych
+tworzonych kontenerów. Znajomość tych mechanizmów nie jest jednak konieczna nawet dla średniozaawansowanych użytkowników środowisk kontenerowych.
+2 Podstawy korzystania z kontenerów
+Dla systemu Linux dostępnych jest wiele środowisk kontenerowych. Niektóre z nich są ogólnego przeznaczenia, inne
+służą do zastosowań specjalizowanych. Obecnie (2022) prawdopodobnie najbardziej popularne rozwiązania służące
+konteneryzacji to: Docker oraz Kubernetes. Obydwa środowiska wywodzą się z firmy Google i do stworzenia obydwu
+wykorzystano język programowania Go. Nie wchodząc w nazbyt szczegółową analizę porównawczą, możemy
+stwierdzić, że obydwa rozwiązania cechuje wysoka funkcjonalność oraz wydajność. Kubernetes stworzono z myślą o
+systemach usług sieciowych, cechujących się wysoką dostępnością. Docker nadaje się zarówno do prostych
+eksperymentów i ćwiczeń, jak i do realizacji sieciowych środowisk klasy „enterprise”. Przy czym, pomimo różnic w
+architekturze oraz założeniach wyjściowych, obydwa pakiety są w wielu aspektach bardzo zbliżone do siebie.
+Wszystkie dalej przedstawione przykłady będą odwoływały się do pakietu Docker.
+Obraz i kontener
+Obraz i kontener to dwa podstawowe pojęcia środowisk konteneryzacji – w tym Dockera. Zanim jednak przejdziemy do
+ich opisu prosty przykład:
+Przykład 1 – uruchomienie kontenera z obrazu "alpine".
+% docker run -it alpine ash
+/ # ps -ef
+PID USER TIME COMMAND
+ 1 root 0:00 ash
+ 9 root 0:00 ps -ef
+/ # whoami
+root
+/ # ls -l /
+total 56
+drwxr-xr-x 2 root root 4096 Apr 14 2021 bin
+drwxr-xr-x 5 root root 360 Jul 30 13:43 dev
+drwxr-xr-x 1 root root 4096 Jul 30 13:43 etc
+drwxr-xr-x 2 root root 4096 Apr 14 2021 home
+drwxr-xr-x 7 root root 4096 Apr 14 2021 lib
+drwxr-xr-x 5 root root 4096 Apr 14 2021 media
+drwxr-xr-x 2 root root 4096 Apr 14 2021 mnt
+drwxr-xr-x 2 root root 4096 Apr 14 2021 opt
+dr-xr-xr-x 236 root root 0 Jul 30 13:43 proc
+drwx------ 1 root root 4096 Jul 30 13:43 root
+drwxr-xr-x 2 root root 4096 Apr 14 2021 run
+drwxr-xr-x 2 root root 4096 Apr 14 2021 sbin
+drwxr-xr-x 2 root root 4096 Apr 14 2021 srv
+dr-xr-xr-x 13 root root 0 Jul 30 13:43 sys
+drwxrwxrwt 2 root root 4096 Apr 14 2021 tmp
+drwxr-xr-x 7 root root 4096 Apr 14 2021 usr
+drwxr-xr-x 12 root root 4096 Apr 14 2021 var
+/ # rm -rf bin
+/ # ps
+ash: ps: not found
+Wywołaliśmy program docker z poleceniem „run” oznaczającym uruchomienie kontenera dla zadanego obrazu.
+Skorzystaliśmy z obrazu „alpine” – jest to bardzo prosty obraz odpowiadający ultra-lekkiej dystrybucji „Alpine Linux”,
+zawierający minimalną liczbę programów narzędziowych, bibliotek, itp. Posiada on shell – „ash” (o składni zbliżonej
+do bash), który kazaliśmy uruchomić. Jeśli uruchomiliśmy środowisko Docker po raz pierwszy lub jeżeli nie
+wykorzystywaliśmy wcześniej obrazu „alpine”, to zostanie on automatycznie pobrany z publicznego repozytorium*.
+Uwaga – w zależności od konfiguracji środowiska Dockera wykonanie polecenia „docker” może wymagać
+uruchomienia go w trybie „sudo” (z uprawnieniami administratora). W przytoczonych przykładach zakładamy, że nie
+jest to konieczne.
+Pierwsze polecenie przeniosło nas do trybu konsoli shell-a ash uruchomionego w nowym kontenerze – łatwo to poznać
+po zmienionym znaku zachęty. Jeśli jednak nie dowierzamy, możemy kazać wyświetlić listę procesów – program ps
+uruchomiony z flagami „ef” pokazuje nam wszystkie procesy aktywne w systemie. Tu jednak działamy w kontenerze –
+procesy systemu macierzystego są niewidoczne, polecenie ps pokazuje więc wyłącznie proces ash (zwróćmy uwagę na
+jego PID równy 1!) oraz samo siebie. Możemy teraz uruchomić kilka typowych programów – np. sprawdzić, jakim
+użytkownikiem jesteśmy (polecenie whoami); wyświetlić zawartość katalogu „/”. Na koniec wykonaliśmy nieco
+brutalny eksperyment – po usunięciu katalogu „/bin” nie jest już możliwe uruchomienie programu ps (oraz oczywiście
+któregokolwiek z programów, które znajdowały się w katalogu bin). Nie musimy się jednak obawiać – pliki zostały
+usunięte wyłącznie z działającego kontenera, nie usunęliśmy ich ani z lokalnego systemu ani z obrazu alpine. Wreszcie
+kontener opuszczamy sekwencją klawiszy ctrl-p/ctrl-q. Aby w pełni opisać przedstawiony przykład, wyjaśnijmy
+znaczenie użytych flag, tym bardziej, że stanowią one dość typowy zestaw, który będzie się pojawiać w dalszych
+przykładach:
+• -i – uruchomia kontener w trybie interaktywnym (dzięki czemu możemy wydawać polecenia i uzyskiwać ich
+wynik)
+• -t – tworzy pseudoterminal pomiędzy konsolą (tj. naszym interpreterem poleceń) a kontenerem, co pozwala na
+większy komfort pracy interakcyjnej.
+Co stało się z uruchomionym kontenerem? Nie został on usunięty, nasza ostatnia akcja spowodowała tylko, że bieżąca
+konsola odłączyła się od niego. Możemy to sprawdzić, wyświetlając listę aktualnie uruchomionych kontenerów:
+Przykład 2 – wyświetlenie listy działających kontenerów.
+gjb@maersk:~$ docker container ls
+CONTAINER ID IMAGE COMMAND CREATED STATUS NAMES
+4b059576b717 alpine "ash" 30 minutes ago Up 30 minutes
+Podłączmy się znów do utworzonego kontenera. W tym celu użyjemy polecenia „attach” podając identyfikator
+kontenera, który poznaliśmy dzięki poleceniu ls:
+Przykład 3 – podłączenie do działającego kontenera.
+gjb@maersk:~$ docker attach 4b059576b717
+/ # ls
+ash: ls: not found
+/ # echo *
+dev etc home lib media mnt opt proc root run sbin srv sys tmp usr var
+/ # exit
+Nie skorzystamy już z programu ls wewnątrz kontenera (usunęliśmy poprzednio większość programów narzędziowych,
+w tym, jak się okazuje, także ls), możemy jednak ciągle wyświetlić zwartość aktualnego katalogu, korzystając z
+wbudowanego w shell ash polecenia "echo" oraz wzorca dopasowania plików „*”. Pozostaje nam zakończyć pracę
+kontenera – zrobimy to, kończąc proces ash, poprzez wydanie mu polecenia „exit”.
+Co składa się więc na obraz kontenera? Przede wszystkim pliki: programy, biblioteki, inne dane – kompletny zestaw
+niezbędny do autonomicznego funkcjonowania. Drugim składnikiem obrazu kontenera są dane konfiguracyjne,
+obejmujące między innymi: lokalizację plików, informację o przydzielonych zasobach, zmiennych środowiskowych
+procesów, konfiguracji sieci, domyślnych parametrach uruchomienia.
+Zapamiętajmy – obraz kontenera jest statyczny, jest to w pewnym sensie komplet informacji „instalacyjnych”.
+Kontener uruchamiany jest na bazie danego obrazu i przekazanych parametrów uruchomiania.
+*W przypadku, gdy obraz, który chcemy uruchomić, nie znajduje się w lokalnym repozytorium, Docker stara się go
+pobrać z puli obrazów publicznych. Poniżej przykład pierwszej próby uruchomienia obrazu „Ubuntu”:
+Przykład 4 – uruchomienie kontenera, którego obraz nie jest dostępny lokalnie i musi zostać pobrany z
+publicznego repozytorium.
+gjb@maersk:~$ docker run -it ubuntu bash
+Unable to find image 'ubuntu:latest' locally
+latest: Pulling from library/ubuntu
+405f018f9d1d: Pull complete
+Digest: sha256:b6b83d3c331794420340093eb706a6f152d9c1fa51b262d9bf34594887c2c7ac
+Status: Downloaded newer image for ubuntu:latest
+root@4f02bdeed096:/# ps -ef
+UID PID PPID C STIME TTY TIME CMD
+root 1 0 0 13:54 pts/0 00:00:00 bash
+root 9 1 0 13:55 pts/0 00:00:00 ps -ef
+3 Przykład − kontenery sieciowe dla programu w C
+Tworzenie obrazów kontenerów
+Kontener to „mini-system opercyjny” – przynajmniej z punktu widzenia konfiguracji jego systemu plików. Na
+szczęście, aby stworzyć dedykowany do naszych potrzeb kontener, nie musimy definiować jego obrazu od podstaw –
+byłoby to bardzo żmudne zajęcie. Typowo korzystamy z gotowego obrazu, który dostosowujemy do naszych potrzeb,
+odpowiednio zmieniając i poszerzając bazową konfigurację. Poniżej znajdują się przykłady konfiguracji kontenerów
+Docker dla naszych dwóch podstawowych programów sieciowych: klient TCP i serwera wykorzystującego funkcję
+select(). Przygotowanie obrazu kontenera przebiega następująco:
+• Tworzymy pusty katalog (jest to dość istotne − nie chcemy zaczynać od katalogu, zawierającego potencjalnie
+dużą liczbę zbędnych plików, które zaśmiecałyby nasz kontener, a być może nawet wpływały negatywnie na
+jego funkcjonowanie lub bezpieczeństwo).
+• W naszym katalogu tworzymy plik o nazwie „dockerfile” (uwaga – bez rozszerzenia!).
+• Kopiujemy do katalogu wszystkie niezbędne do funkcjonowania kontenera pliki (w naszym przypadku pliki
+źródłowe w języku C; w bardziej rozbudowanym projekcie byłyby to także pliki konfiguracyjne, biblioteki,
+plik makefile, itp.).
+Przykład 5 – Tworzenie obrazu kontenera dla klienta sieciowego przy pomocy pliku dockerfile
+% mkdir Client
+% cd Client
+% cat > dockerfile
+FROM gcc:4.9
+COPY . /Sockets
+WORKDIR /Sockets/
+RUN gcc -o sock_client1 sock_client1.c
+ENTRYPOINT ["./sock_client1"]
+ctrl-D
+% docker build -t client1_docker .
+Step 1/5 : FROM gcc:4.9
+ ---> 1b3de68a7ff8
+Step 2/5 : COPY . /Sockets
+ ---> Using cache
+ ---> 665dea367302
+Step 3/5 : WORKDIR /Sockets/
+ ---> Using cache
+ ---> 225256d0d17d
+Step 4/5 : RUN gcc -o sock_client1 sock_client1.c
+ ---> Using cache
+ ---> 4547f659d9ba
+Step 5/5 : ENTRYPOINT ["./sock_client1"]
+ ---> Using cache
+ ---> 799f0d9bc02b
+Successfully built 799f0d9bc02b
+Successfully tagged client1_docker:latest
+%
+Wyjaśnimy teraz znaczenie poszczególnych dyrektyw pliku dockerfile: − linijka po linijce:
+FROM gcc:4.9
+Kontener będzie korzystał z obrazu gcc w wersji 4.9 pochodzącego z publicznego repozytorium – to najbardziej typowy
+obraz, z którego korzystamy w przypadku budowy programu C bezpośrednio ze źródeł.
+COPY . /Sockets
+Kopiujemy wszystkie pliki (tutaj pliki źródłowe) do katalogu /Sockets. Kopiowanie oznacza kopiowanie wszystkich
+plików z lokalnego katalogu "." do systemu plików obrazu kontenera.
+WORKDIR /Sockets/
+Katalogiem roboczym dla kontenera będzie wskazany katalog (a nie np. "/").
+RUN gcc -o sock_client1 sock_client1.c
+Podczas budowy obrazu uruchomiony zostanie kompilator gcc i ze źródeł stworzony zostanie program wykonywalny.
+ENTRYPOINT ["./sock_client1"]
+Uruchomienie kontenera skutkuje automatycznym uruchomieniem wskazanego programu, dzięki dyrektywie
+ENTRYPOINT możemy też za pośrednictwem polecenia "docker run" przekazać argumenty do uruchamianego
+programu. Ta dyrektywa jest typowo stosowana w przypadku programów sieciowych (serwerów), uruchamianych wraz
+z kontenerem.
+Tak samo, jak dla klienta postąpimy przy konfigurowaniu kontenera dla serwera:
+Przykład 6 – Tworzenie obrazu kontenera dla klienta sieciowegop przy pomocy pliku dockerfile
+% mkdir Server
+% cd Server
+% cat > dockerfile
+FROM gcc:4.9
+COPY . /Server
+WORKDIR /Server/
+RUN gcc -o sock_select1 sock_select1.c
+CMD ["./sock_select1"]
+ctrl-D
+% docker build -t server1_docker .
+...
+Successfully tagged server1_docker:latest
+%
+Uważny czytelnik może zgłosić tu jedną wątpliwość – dlaczego budujemy osobne obrazy kontenerów dla klienta i dla
+serwera? Czy nie prościej byłoby (zwłaszcza dla tak prostych programów) uruchomić je w jednym kontenerze?
+Odpowiedź jest następująca – oczywiście możemy tak zrobić, kontener może zawierać wiele równolegle działających
+procesów (tak samo, jak „prawdziwy” i autonomiczny system operacyjny). Chcemy jednak uruchomić program kliencki
+i serwerowy w osobnych kontenerach z dwóch powodów: (1) chcemy maksymalnie zbliżyć się do rzeczywistego
+scenariusza, w którym klient i serwer funkcjonują na zupełnie różnych maszynach; (2) chcemy, aby klient i serwer
+posiadały odrębne stosy sieciowe.
+Kontenery i sieci
+Wielką zaletą środowiska Dockera jest łatwość i elastyczność uruchamiania komunikacji sieciowej pomiędzy
+kontenerami. Docker oferuje kilka trybów połączeń sieciowych. Zacznijmy od przydatnego polecenia: „docker network
+ls”.
+Przykład 7 – Wyświelanie dostępnych sieci
+gjb@maersk:~$ docker network ls
+NETWORK ID NAME DRIVER SCOPE
+bc40c52c107b bridge bridge local
+44130a0d2004 host host local
+213233b84e99 none null local
+W czystej instalacji Dockera mamy dostępnych kilka bazowych typów sieci, w tym:
+• bridge – domyślny typ sieci, pozwala na uruchamianie kontenerów z własnymi adresami IPv4/IPv6 i prostą
+realizację komunikacji między nimi;
+• host − kontenery korzystające z sieci tego typu współdzielą 3 i 4 warstwę sieciową z systemem bazowym (w
+tym trybie sieci kontenerów i systemu hosta są wspólne);
+• none – brak sieci.
+Docker oferuje też kilka innych typów sieci do bardziej zaawansowanych zastosowań, ale nie będziemy ich teraz
+opisywać.
+Sieć utworzona w trybie bridge domyślnie przydziela odrębny prywatny adres IP każdemu kontenerowi. Jeśli potrzeba
+jest bardziej precyzyjna kontrola nad adresacją, możemy ustalać adresy (i inne parametry sieci) ręcznie.
+Przyjrzyjmy się konfiguracji sieci bridge:
+Przykład 8 – Parametry domyślnej sieci bridge (część konfiguracji pominięto)
+gjb@maersk:~$ docker network inspect bridge
+[
+ {
+ "Name": "bridge",
+ "Id": "bc40c52c107b22a32549f9779314ed210bc1a6dfd1c62f18a54d555176ab03b4",
+ "Created": "2022-07-23T00:16:02.420456425Z",
+ "Scope": "local",
+ "Driver": "bridge",
+ "EnableIPv6": false,
+ "IPAM": {
+ "Driver": "default",
+ "Options": null,
+ "Config": [
+ {
+ "Subnet": "172.17.0.0/16",
+ "Gateway": "172.17.0.1"
+ }
+ ]
+ },
+ "ConfigOnly": false,
+ "Containers": {},
+ "Options": {
+ "com.docker.network.bridge.default_bridge": "true",
+ "com.docker.network.bridge.enable_icc": "true",
+ "com.docker.network.bridge.enable_ip_masquerade": "true",
+ "com.docker.network.bridge.host_binding_ipv4": "0.0.0.0",
+ "com.docker.network.bridge.name": "docker0",
+ "com.docker.network.driver.mtu": "1500"
+ },
+ "Labels": {}
+ }
+]
+Z pokazanej informacji wynika między innymi, że sieć „bridge” posługuje się adresami prywatnymi klasy B z puli
+172.17.0.0/16; nie ma skonfigurowanego stosu IPv6 (zapewne nie ma go także system hosta); domyślną bramą jest
+interfejs 172.17.0.1; z sieci nie korzysta żaden kontener (pusta lista „Containers”).
+Utwórzmy teraz sieć cs_network, którą będziemy posługiwać się w obsłudze naszych kontenerów: klienckiego i
+serwerowego − będzie ona dość podobna do bazowej sieci bridge. Sprawdźmy też od razu konfigurację nowej sieci.
+Uwaga − przy eksperymentach z oprogramowaniem klient-serwer utworzenie osobnej sieci nie jest konieczne, można z
+powodzeniem posługiwać się siecią bridge, jednak tworzenie nowej sieci jest dobrą praktyką. Zwłaszcza, jeśli mamy
+zamiar uruchamiać kilka zestawów komunikujących się kontenerów. Inne powody, aby tak postępować podamy dalej.
+Przykład 9 – Tworzenie i sprawdzenie parametrów nowej sieci (część konfiguracji pominięto)
+gjb@maersk:~$ docker network create cs_network
+22fdb9e6bdd06f7932e07331a171f3c66dc0f65a95d2a40448d8503940ec5c32
+gjb@maersk:~$ docker network inspect cs_network
+[
+ {
+ "Name": "cs_network",
+ "Id": "22fdb9e6bdd06f7932e07331a171f3c66dc0f65a95d2a40448d8503940ec5c32",
+ "Created": "2022-08-02T13:47:07.272018987Z",
+ "Scope": "local",
+ "Driver": "bridge",
+ "EnableIPv6": false,
+ "IPAM": {
+ "Driver": "default",
+ "Options": {},
+ "Config": [
+ {
+ "Subnet": "172.21.0.0/16",
+ "Gateway": "172.21.0.1"
+ }
+ ]
+ },
+ "ConfigOnly": false,
+ "Containers": {},
+ "Options": {},
+ "Labels": {}
+ }
+]
+Nowa sieć jest nieomal identyczna, jak domyślna sieć bridge, jedyna dobrze widoczna różnica dotyczy adresacji −
+Docker przyznał nową pulę adresów IPv4: 172.21.0.0/16.
+Uruchomienie pierwszego przykładu
+Mamy już przygotowane obrazy kontenerów klienta (client1_docker) i serwera (server1_docker) oraz skonfigurowaną
+sieć cs_network, w której będą znajdować się stosy sieci IVv4 obydwu kontenerów. W pierwszej kolejności
+uruchomimy program serwera, wyświetli on na terminalu numer losowo przydzielonego portu, który następne
+przekażemy jako argument uruchomienia dla klienta − przykład niżej:
+Przykład 10 – Uruchomienie serwera C w dedykowanej sieci
+gjb@maersk:~/Projects/PSI$ docker run -it --network-alias server1 --network
+cs_network --name server1 server1_docker:latest
+Socket port #59923
+Timeout, restarting select...
+Timeout, restarting select...
+Ctrl-p Ctrl-q
+gjb@maersk:~/Projects/PSI$ docker container ls
+CONTAINER ID IMAGE COMMAND CREATED STATUS
+PORTS NAMES
+cd770c3c61b3 server1_docker:latest "./sock_select1" 24 seconds ago Up 23
+seconds server1
+Polecenie „docker run” z flagami „-it” uruchomiło kontener w trybie interaktywnym z terminalem, w sieci
+„cs_network”, kontener otrzymał alias sieciowy „server1” i taką samą nazwę. Ponieważ klient jeszcze nie działa serwer
+nasłuchuje w pętli select() / accept() i zwraca komunikat timeout.
+Możemy teraz uruchomić drugi kontener z klientem − przykład poniżej:
+Przykład 11 – Uruchomienie klienta C w dedykowanej sieci
+gjb@maersk:~/Projects/PSI$ docker run -it --network cs_network client1_docker:latest
+server1 57911
+Starting...
+Server IP: 172.21.0.2
+Connecting...
+Connected.
+Data sent.
+gjb@maersk:~/Projects/PSI/docker_C/Client$ docker container ls
+CONTAINER ID IMAGE COMMAND CREATED STATUS
+PORTS NAMES
+0686cf38e60c server1_docker:latest "./sock_select1" 35 minutes ago Up 35
+minutes server1
+Argumenty wywołania dla klienta to nazwa (adres sieciowy) i port serwera: „57911”. Po zakończeniu klienta
+wyświetlamy jeszcze raz listę działających w systemie kontenerów − klienta na niej nie ma, gdyż jego program (a więc
+i kontener) zakończył funkcjonowanie.
+Uwaga − „pod maską” dzieje się w tym przykładzie nieco więcej niż widać na pierwszy rzut oka. Przyjrzyjmy się
+uważniej rozwiązywaniu nazw − przekazaliśmy klientowi nazwę serwera „server1”, a klient znalazł ją poprzez
+zapytanie DNS i poprawnie rozwiązał na adres IP „172.21.0.2". Jak jednak mogło się to udać – nazwa "server1" nie
+znajduje się w publicznym DNS? Docker utrzymuje własny serwis DNS, który obsługuje sieci typu bridge.
+Jednocześnie serwer ten jest w stanie przekazywać zapytania o nazwy FQDN do zewnętrznego serwera DNS
+(domyślnie jest to serwer DNS Google). Tak więc otrzymujemy dwie funkcjonalności – prywatny (na użytek
+kontenerów) i publiczny serwis DNS. Na koniec dodajmy, że prywatny serwer i prywatne nazwy nie są obsługiwane w
+podstawowej sieci „bridge” − to kolejny argument, aby używać własnych skonfigurowanych do konkretnych potrzeb
+sieci.
+Komunikaty z kontenera i logowanie
+W poprzednim przykładzie, uruchamiając serwer musieliśmy poznać przyznany numer portu, dlatego też
+skorzystaliśmy z trybu interaktywnego z terminalem (flagi „-it”). Następnie przeszliśmy w tryb odłączonego terminala.
+Dla naszego bardzo prostego serwera, który generuje mało komunikatów, nie jest to problemem, jednak mogłoby być
+w przypadku programu, który na standardowym wyjściu generuje wiele danych. Dlatego (zwłaszcza w przypadku
+wszelkiego rodzaju procesów usługowych, demonów sieciowych, itp.) warto uruchomić serwis w trybie
+nieinteraktywnym i gdy chcemy poznać generowane komunikaty posłużyć się poleceniem podglądu logów – przykład
+poniżej.
+Przykład 12 – Uruchomienie serwera w dedykowanej sieci
+gjb@maersk:~/Projects/PSI$ docker run -dit --network-alias server1 --network
+cs_network --name server1 server1_docker:latest
+3c647725a60c014989941073d5eb99b91dd4c895014caf97096fd491eee1bdcb
+gjb@maersk:~/Projects/PSI$ docker logs --tail 5 --follow server1
+Socket port #59771
+Timeout, restarting select...
+Timeout, restarting select...
+Jedyna różnica w stosunku to poprzedniego uruchomienia to flagi – dodanie opcji „-d” (detach) powoduje, że kontener
+nie będzie podłączony do bieżącego terminala (choć dzięki flagom -it nadal będzie pracował interaktywnie). Możemy
+przejrzeć logi kontenera przy pomocy polecenia „docker logs”; opcja „--tail” pozwala na sprawdzenie poprzednich n
+wpisów, opcja „--follow” powoduje, że nasz terminal pozostanie podłączony do standardowego wyjścia kontenera, do
+czasu aż naciśniemy Ctrl-C.
+Uwaga − istnieje wiele trybów logowania, które można zmieniać zarówno na poziomie kontenera, jak i globalnej
+konfiguracji Dockera. Warto też pamiętać, że w domyślnym trybie, zilustrowanym wyżej, logi będą zawierać zarówno
+komunikaty generowane na standardowe wyjście (stdout) jak i na standardowy błąd (stderr) procesu kontenera.
+Trochę więcej przydatnych funkcji
+W przypadku testowania usług sieciowych przydatne może być polecenie „docker stats”, które pokazuje podsumowanie
+zużycia najważniejszych zasobów i liczników danych – w tym informacje dotyczące ruchu sieciowego. Należy jednak
+pamiętać, że nawet w przypadku gdy nie ma komunikacji sieciowej na poziomie warstwy czwartej, statystyki i tak
+wykażą pewien ruch wynikający z obsługi niższych warstw – przykład dla serwera poniżej.
+Przykład 13 – Statystyki kontenera na przykładzie serwera – przed i po podłączeniu klienta
+gjb@maersk:~/Projects/PSI$ docker stats server1
+CONTAINER ID NAME CPU % MEM USAGE / LIMIT MEM % NET I/O BLOCK I/O PIDS
+f2d21bf4146d server1 0.00% 704KiB / 7.771GiB 0.01% 56B / 0B 0B / 0B 1
+gjb@maersk:~/Projects/PSI$ docker run -it --network cs_network client1_docker:latest server1
+53999
+gjb@maersk:~/Projects/PSI$ docker stats server1
+CONTAINER ID NAME CPU % MEM USAGE / LIMIT MEM % NET I/O BLOCK I/O PIDS
+f2d21bf4146d server1 0.00% 704KiB / 7.771GiB 0.01% 1.36kB / 854B 0B / 0B 1
+4 Przykład − kontenery sieciowe dla programu w Pythonie
+Przygotowanie programów
+Będziemy bazować na dwóch przykładach: prostym serwerze TCP zwracającym echo danych oraz kliencie testującym.
+W stosunku do podstawowego kodu serwera wprowadziliśmy tylko jedną istotną zmianę – funkcja accept() działa teraz
+w trybie timeout-u (ściśle – gniazdo nasłuchujące ma skonfigurowany timeout). Dzięki tej modyfikacji co kilka sekund
+uzyskujemy komunikat z nasłuchującego serwera. Podobnie jak w przypadku programu w języku C kod serwera i
+klienta umieścimy w dwóch katalogach o nazwach: Server i Client. W każdym katalogu znajdować się będzie
+odpowiedni plik źródłowy .py oraz manifest dockerfile – przykład niżej.
+Przykład 14 – konfiguracja środowiska serwera Python
+gjb@maersk:~/Projects/PSI/docker_P/Server$ cat dockerfile
+FROM python:3
+ADD tcp_server_to.py /
+ENTRYPOINT [ "python", "./tcp_server_to.py" ]
+gjb@maersk:~/Projects/PSI/docker_P/Server$ docker build -t pserver1 .
+Sending build context to Docker daemon 4.096kB
+Step 1/3 : FROM python:3
+3: Pulling from library/python
+001c52e26ad5: Pull complete
+d9d4b9b6e964: Pull complete
+...
+Digest: sha256:cbf49327fae903d64ab28251912fc00faea2c1baee493d347a07973a2cb50f98
+Status: Downloaded newer image for python:3
+ ---> b62e4294564c
+Step 2/3 : ADD tcp_server_to.py /
+ ---> e4819bdf85e8
+...
+Successfully built 4c4191432642
+Successfully tagged pserver1:latest
+gjb@maersk:~/Projects/PSI/docker_P/Server$
+Korzystamy z interpretera Pythona w wersji 3; potrzebujemy tylko jednego pliku źródłowego, który dodajemy
+dyrektywą ADD; korzystamy z dyrektywy ENTRYPOINT, gdyż chcemy przekazać do programu serwera parametry.
+Podobnie postąpimy dla klienta – przykład niżej:
+Przykład 15 – konfiguracja środowiska klienta Python
+gjb@maersk:~/Projects/PSI/docker_P/Client$ cat dockerfile
+FROM python:3
+ADD tcp_client.py /
+ENTRYPOINT [ "python", "./tcp_client.py" ]
+gjb@maersk:~/Projects/PSI/docker_P/Client$ docker build -t pclient1 .
+Sending build context to Docker daemon 3.584kB
+Step 1/3 : FROM python:3
+ ---> b62e4294564c
+...
+Successfully built 7f9ab20b693e
+Successfully tagged pclient1:latest
+gjb@maersk:~/Projects/PSI/docker_P/Client$
+Możemy teraz przejść do uruchomienia serwera i klienta. Tak jak w przypadku poprzedniego przykładu dla programów
+w języku C, skorzystamy z tej samej utworzonej wcześniej sieci cs_network. Serwer i klient domyślnie korzystają z
+portu 8000, jednak aby przetestować przekazanie portu jako argumentu zmieńmy port na 8001:
+Przykład 16 – Uruchomienie serwera Python w dedykowanej sieci
+gjb@maersk:~/Projects/PSI/docker_P/Server$ docker run -it --network-alias pserver1
+--hostname pserver1 --network cs_network --name pserver1 pserver1 8001
+Will listen on pserver1 : 8001
+accept() timeout, restarting...
+accept() timeout, restarting...
+Connect from: ('172.21.0.3', 41168)
+Connection closed by client
+accept() timeout, restarting...
+Connect from: ('172.21.0.3', 41170)
+Connection closed by client
+accept() timeout, restarting...
+^Caccept() interrupted, ending.
+gjb@maersk:~/Projects/PSI/docker_P/Server$ docker rm pserver1
+pserver1
+gjb@maersk:~/Projects/PSI/docker_P/Server$
+Zwróćmy uwagę, że serwer jako swoją domyślną nazwę podał tę, którą zadaliśmy w parametrze „hostname”.
+Gdybyśmy pominęli ten parametr, wyświetlona zostałaby nazwa robocza, którą automatycznie wygenerował Docker,
+ale także w takim przypadku serwer odpowiadał by poprawnie pod nazwą sieciową „pserver1”. Dalsze linijki
+komunikatów z serwera wynikają z podłączenia się do niego klientów. Pracę serwera przerywamy naciskając Ctrl-C.
+Wyjątek taki jest obsługiwany w kodzie, pojawia się więc stosowny komunikat. Ostatnie polecenie usuwa kontener
+serwera, nie jest ono konieczne, ale bez usunięcia kontenera (który nie posiada już działającego procesu serwera) nie
+uruchomimy go ponownie. Dla porządku prześledźmy wywołanie klienta – przykład niżej:
+Przykład 17 – Uruchomienie klienta Python w dedykowanej sieci
+gjb@maersk:~/Projects/PSI/docker_P/Client$ docker run -it --network cs_network pclient1 pserver1
+8001
+Will connect to pserver1 : 8001
+Received b'Hello, world!'
+Client finished.
+gjb@maersk:~/Projects/PSI/docker_P/Client$ docker run -it --network cs_network pclient1 pserver1
+8001
+Will connect to pserver1 : 8001
+Received b'Hello, world!'
+Client finished.
+gjb@maersk:~/Projects/PSI/docker_P/Client$
+Klient został uruchomiony dwa razy z rzędu. Zaważmy, że przekazaliśmy do skryptu dwa parametry – nazwę serwera
+(pserver1) i port (8001).
+5. Przykład − kontenery sieciowe dla protokołu IPv6
+Poniżej przedstawimy przykłady uruchomienia klienta i serwera sieciowego korzystających z protokołu IPv6. Obsługa
+sieć IPv6 w środowisku Dockera, w chwili tworzenia niniejszego podręcznika ma charakter „eksperymentalny”.
+Dodatkowo, filozofia alokacji i posługiwania się adresami IPv6 jest nieco inna niż w przypadku adresów IPv4, dlatego
+też zademonstrujemy pełną sekwencję kroków niezbędną do uruchomienia testowego systemu klient-serwer dla tego
+protokołu.
+Programy, którymi będziemy się posługiwać, tj. klient i serwer zbudowane są nieomal identycznie jak te, które pojawiły
+się w przykładzie dla sieci IPv4. Jedyna różnica związana jest z tym, że na poziomie L3 obsługują one IPv6. Nie
+będziemy się też posługiwać adresami symbolicznymi, lecz numerycznymi adresami warstwy 3.
+Uwaga – adresy i klasy adresowe IPv6
+Adresy IPv6 mają długość 128 bitów. Zapisujemy je w następujący sposób: 2001:0db8::0001:0000. Można też
+posłużyć się zapisem skrótowym, pomijając zera i bloki zer. Powyższy adres można więc też zapisać jako:
+2001:db8::1:0. Podobnie jak dla adresów IPv4, w adresie IPv6 wyróżniamy starszą ("rutowalną") część oraz
+młodszą część związaną z hostem. Na przykład, sieć zapisana (w tzw. notacji CIDR) jako 2001:db8:1234::/48
+zaczyna się od adresu 2001:db8:1234:0000:0000:0000:0000:0000, a kończy na adresie
+2001:db8:1234:ffff:ffff:ffff:ffff:ffff (/48 oznacza tu 48 bitów długości starszej części adresu).
+W adresacji IPv6 nie wyróżniamy klas A, B, C, itd., znanych nam z IPv4, jednak pewne zakresy adresowe mają
+specjalne znacznie. Nie będziemy omawiać wszystkich z nich, warto jednak wiedzieć, że adres:
+• ::1/128 – oznacza "loopback" (taki jak 127.0.0.1/8 w IPv6). Jest to najprostszy w użyciu i
+"najbezpieczniejszy" do zastosowania w testach adres IPv6, gdyż nie wymaga dodatkowej konfiguracji
+interfejsów L3.
+• fc00::/7 – to adresy o nazwie "Unique local addresses (ULAs)". Sa one odpowiednikiem adresów
+należących do wyznaczonych klas nierutowalnych w IPv4 (tj: 10.0.0.0/8, 172.16.0.0/12 i 192.168.0.0/16).
+Skorzystanie z adresu ULA wymaga skonfigurowania interfejsu L3.
+• fe80::/10 – to adresy "link-local prefix" legalne tylko w sieci lokalnej. W młodszej części może znaleść się
+adres MAC lokalnego interfejsu sieciowego.
+• 2001:db8::/32 to adres używany w dokumentacji i przykładach, nie jest jednak wskazane używanie go w
+działającym kodzie.
+• nnnn:nnnn:nnnn:nnnn:hhhh:hhhh:hhhh:hhhh/64 – to postać rutowalnego adresu IPv6, starsze 64 bity
+to adres sieci CIDR, młodsze 64 bity zawierają typowo adres MAC interfejsu sieciowego (który dla sieci
+Ethernet oraz bezprzewodowych sieci WiFi ma 48 bitów)
+• Dodatkowo pewne adresy są zarezerowane do specjalnych funkcji, takich jak przenoszenie IPv4 i innych,
+tych adresów nie należy używać. Są to m.in. zakresy: ::ffff:0:0/96 i ff00::/8
+Konfiguracja Dockera do pracy z IPv6.
+W pierwszej kolejności musimy upewnić się, czy nasza instalacja Dockera obsługuje pracę z sieciami IPv6.
+Przykład 18 – weryfikacja środowiska IPv6 Dockera. Standardowo zainstalowany Docker nie obsługuje sieci IPv6.
+Wymagana jest niewielka zmiana konfiguracji, aby tak się stało. Powinniśmy zlokalizować plik konfiguracyjny i
+zweryfikować jego zawartość:
+gjb@maersk:~$ cat /etc/docker/daemon.json
+...
+{
+ "experimental": true,
+ "ip6tables": true
+}
+Jeśli powyższy wpis nie znajduje się w pliku konfiguracyjnym, należy go dodać i zrestartować demon Dockera:
+gjb@maersk:$ sudo systemctl restart docker
+Uwaga: Jeżeli Docker został zainstalowany poprzez mechanizm snap to lokalizacja pliku i sposób restartu będzie
+nieco inny.
+Po upewnieniu się, że Docker obsługuje sieci IPv6, możemy przystąpić do skonfigurowania testowej sieci, co pokazuje
+kolejny przykład. Użyjemy klasy adresów lokalnych ULA z prefiksem /64
+Przykład 19 – Tworzenie i sprawdzenie parametrów nowej sieci (część konfiguracji pominięto):
+gjb@maersk:~$ docker network create --ipv6 --subnet fc00::/64 ip6net
+ip6net
+gjb@maersk:~$ docker network inspect ip6net
+[
+ {
+ "Name": "ip6net",
+ "Id": "ea2ce28fb03db1ed7ff206eac0f2e151de727a86a794560b69f1f43b63106588",
+ "Created": "2023-06-28T13:27:25.59862201Z",
+ "Scope": "local",
+ "Driver": "bridge",
+ "EnableIPv6": true,
+ "IPAM": {
+ "Driver": "default",
+ "Options": {},
+ "Config": [
+ {
+ "Subnet": "172.19.0.0/16",
+ "Gateway": "172.19.0.1"
+ },
+ {
+ "Subnet": "fc00::/64"
+ }
+ ]
+. . .
+ }
+]
+Dalej zakładamy, że posiadamy już dwa obrazy kontenerów podobne do tych z poprzednich przykładów:
+ip6client1_docker oraz ip6server1_docker. Możemy uruchomić je w sieci ip6net. Zaczniemy od serwera, przekazują mu
+jawnie adres sieciowy L3:
+Przykład 20 – Uruchomienie serwera C w dedykowanej sieci IPv6:
+gjb@maersk:~/Projects/PSI$ docker run -it --network ip6net --name ipv6server1 --
+ip6=fc00::3 ip6server1_docker:latest
+Socket port #32773
+Timeout, restarting select...
+Timeout, restarting select...
+Ctrl-p Ctrl-q
+gjb@maersk:~/Projects/PSI$ docker container ls
+CONTAINER ID IMAGE COMMAND CREATED STATUS
+PORTS NAMES
+47e45447be4a ipv6server1_docker:latest "./sock_server1" About an hour ago Up
+About an hour ipv6server1
+Polecenie „docker run” z flagami „-it” uruchomiło kontener w trybie interaktywnym z terminalem, w sieci „ip6net”,
+kontener otrzymał nazwę „ip6server1”. Ponieważ klient jeszcze nie działa, serwer nasłuchuje w pętli select() / accept() i
+zwraca komunikat timeout. Możemy też sprawdzić, jak obecnie wygląda konfiguracja sieci ip6net – okazuje się, że
+pojawił się w niej wpis o interfejsie sieciowym działającego kontenera serwera:
+Przykład 21 – Uruchomienie serwera C w dedykowanej sieci IPv6
+gjb@maersk:~/Projects/PSI$ docker network inspect ip6net
+[
+ {
+ "Name": "ip6net",
+
+. . .
+ "Containers": {
+ "47e45447be4a968abad8fefbc10522248813b3226a602bc4e6657b4fce4bf4a6": {
+ "Name": "ipv6server1",
+ "EndpointID":
+"a9087ebae6302f5a4f9b21a3ed1249d198f346364d4398c7a5926d9c7638b52b",
+ "MacAddress": "02:42:ac:13:00:02",
+ "IPv4Address": "172.19.0.2/16",
+ "IPv6Address": "fc00::3/64"
+ }
+. . .
+Możemy teraz uruchomić kontener z klientem − przykład poniżej:
+Przykład 22 – Uruchomienie klienta C w dedykowanej sieci IPv6:
+gjb@maersk:~/Projects/PSI$ docker run -it --network ip6net ipv=6client1_docker:latest
+fc00::3 32773
+Starting...
+Argumenty wywołania dla klienta to adres sieciowy: „fc00::3” i port serwera: „32773”.
+6 Przykład − wprowadzanie opóźnień, zakłóceń i błędów do ruchu UDP
+W rzeczywistym środowisku sieci rozległych dość często dochodzi do różnego rodzaju zakłóceń ruchu, na przykład:
+opóźnień, gubienia i uszkodzenia pakietów. Zjawiska takie trudno zaobserwować w sieciach LAN, które zazwyczaj
+cechuje duża niezawodność i stabilność parametrów czasowych ruchu, a jest to praktycznie niemożliwe w sieciach
+kontenerowych zlokalizowanych na jednej maszynie. Możemy jednak przy pomocy prostych do użycia mechanizmów
+zasymulować zachowanie „prawdziwych”, tj. zawodnych sieci. W tym celu posłużymy się nowym mechanizmem
+„docker compose” pozwalającym na proste uruchamianie więcej niż jednego kontenera w jednej sieci. (Te same efekty
+moglibyśmy uzyskać bez wtyczki compose, jednak zapewnia ona spójne uruchamianie kontenerów, prezentację
+wyników ich działania, pozwala też na prostszą konfigurację środowisk wielo-kontenerowych).
+Przykład 23 – plik konfiguracyjny w formacie yaml dla dwóch kontenerów uruchamianych poprzez "compose"
+gjb@maersk:~/compose_UDP$ cat docker-compose.yaml
+version: "3.0"
+services:
+ sink:
+ container_name: udp_sink2
+ build: ./sink
+ tty: true
+ cap_add:
+ - NET_ADMIN
+ source:
+ container_name: udp_source2
+ build: ./source
+ tty: true
+ cap_add:
+ - NET_ADMIN
+W pliku zdefiniowano dwa serwisy: „source” oraz „sink” uruchamiane odpowiednio jako kontenery udp_source2 i
+udp_sink2; kontenery są zdefiniowane w folderach: source i sink; pracują w trybie terminalowym (generują
+komunikaty na stdout i stderr). Dodanie właściwości NET_ADMIN pozwoli nam na zmianę parametrów stosu
+sieciowego i tym samym na symulację zakłóceń ruchu pakietów.
+Przykładowe programy source i sink odpowiednio wysyłają i przyjmują datagramy UDP. Datagramy są stałej długości
+500B, w każdym na początku znajduje się zapisana tekstowo kolejna wartość licznika oraz wartość czasu nadania.
+Odbiorca wyświetla na konsoli numer odebranego datagramu oraz różnicę czasów (w ms) między odebraniem,a
+nadaniem datagramu. (Oczywiście, gdyby nadawca i odbiorca znajdowali się na różnych maszynach, należałoby zadbać
+o synchronizację ich zegarów, ale w środowisku jednej maszyny nie ma tego problemu).
+Kontenery source oraz sink muszą oczywiście posiadać odpowiednie pliki dockerfile, oto ich zawartości:
+Przykład 24 – plik konfiguracyjne dockerfile dla programów source i sink:
+gjb@maersk:~/compose_UDP$ cat source/dockerfile
+FROM gcc:4.9
+COPY . /Client
+WORKDIR /Client
+RUN gcc -o udp_source2 udp_source2.c
+CMD ["./udp_source2", "udp_sink2", "8888", "10", "1000"]
+gjb@maersk:~/compose_UDP$ cat sink/dockerfile
+FROM gcc:4.9
+COPY . /Server
+WORKDIR /Server/
+RUN gcc -o udp_sink2 udp_sink2.c
+CMD ["./udp_sink2", "8888"]
+Parametry wywołania podane w dyrektywie CMD w powyższym przykładzie mają następujące znaczenie:
+• source: nazwa odbierającego, port odbierającego, liczba pakietów do wysłania, opóźnienie pomiędzy
+pakietami w ms
+• sink: port odbierającego
+Zaletą wykorzystania „docker compose” jest dużo prostsze budowanie, uruchamianie oraz „sprzątanie” środowiska
+kontenerów. Poniższy przykład pokazuje budowę środowiska „source-sink” oraz jego uruchomienie.
+Przykład 25 – budowanie środowiska przy pomocy docker-compose. Należy zadbać tylko o to, aby bieżący
+katalog był ustawiony na katalog, w którym znajduje się plik .yaml. Uwaga: w zależności od sposobu instalacji
+środowiska dockera używamy specjalnego polecenia "docker-compose" lub po prostu: "docker compose". Z
+przykładu usunięto niektóre mniej istotne komunikaty.
+gjb@maersk:~/compose_UDP$ docker-compose build
+Building sink
+Step 1/6 : FROM gcc:4.9
+ ---> 1b3de68a7ff8
+Step 2/6 : COPY . /Server
+ ---> b6c355c4caee
+Step 3/6 : WORKDIR /Server/
+ ---> Running in 3ac142f2233f
+Step 4/6 : RUN gcc -o udp_sink2 udp_sink2.c
+ ---> Running in 1ab13cd95b40
+Removing intermediate container 1ab13cd95b40
+ ---> af80b1957476
+Step 6/6 : CMD ["./udp_sink2", "8888"]
+ ---> Running in e108c5ded13e
+Successfully built 488fcf2271ae
+Successfully tagged compose_udp_sink:latest
+Building source
+Step 1/5 : FROM gcc:4.9
+ ---> 1b3de68a7ff8
+Step 2/5 : COPY . /Client
+Step 3/5 : WORKDIR /Client
+Step 4/5 : RUN gcc -o udp_source2 udp_source2.c
+Step 5/5 : CMD ["./udp_source2", "udp_sink2", "8888", "300", "1000"]
+Successfully built 68a6699bc2bc
+Successfully tagged compose_udp_source:latest
+Uruchomienie wszystkich kontenerów jest równie proste, posłużymy się poleceniem „up”:
+Przykład 26 – Uruchamienie środowiska przy pomocy docker-compose up:
+gjb@maersk:~/compose_UDP$ docker-compose up
+Starting udp_sink2 ... done
+Starting udp_source2 ... done
+Attaching to udp_sink2, udp_source2
+udp_source2 | address resolved...
+udp_source2 | sending packets to: 192.168.96.2
+udp_source2 | -> #0
+udp_sink2 | bind() successful
+udp_sink2 | waiting for packets...
+udp_sink2 | recvfrom ok
+udp_sink2 | Received 500 bytes from udp_source2.compose_udp_default:56269
+udp_sink2 | Received counter = 0 time_delta = 1.21
+udp_source2 | -> #1
+udp_sink2 | recvfrom ok
+udp_sink2 | Received 500 bytes from udp_source2.compose_udp_default:56269
+udp_sink2 | Received counter = 1 time_delta = 0.61
+udp_sink2 | recvfrom ok
+udp_sink2 | Received 500 bytes from udp_source2.compose_udp_default:56269
+udp_sink2 | Received counter = 2 time_delta = 0.55
+udp_source2 | -> #2
+udp_source2 exited with code 0
+Programy wyświetlają numer sekwencyjny pakietu, dodatkowo proces odbierający drukuje też „różnicę” między
+czasem nadania a odebrania. Jak widać, wynosi ona około 1 ms. Warto zwrócić uwagę na to, że komunikaty od dwóch
+kontenerów nie zawsze następują po sobie w poprawnej kolejności (komunikat o odebraniu może następować przed
+odpowiadającym mu komunikatem o wysłaniu!).
+Docker compose pozwala także na zatrzymywanie (i ewentualnie „posprzątania”) działającego środowiska. Służą do
+tego polecenia „down” oraz „kill”, oto przykłady ich użycia:
+Przykład 27 – zatrzymanie środowiska przy pomocy docker-compose stop:
+gjb@maersk:~/compose_UDP$ sudo docker-compose up
+Starting udp_sink2 ... done
+Starting udp_source2 ... done
+Attaching to udp_sink2, udp_source2
+...
+udp_source2 | -> #9
+udp_sink2 | recvfrom ok
+udp_sink2 | Received 500 bytes from udp_source2.compose_udp_default:35665
+udp_sink2 | Received counter = 9 time_delta = 0.92
+gjb@maersk:~/compose_UDP$ sudo docker-compose stop
+Stopping udp_sink2 ... done
+Stopping udp_source2 ... done
+udp_sink2 exited with code 137
+udp_source2 exited with code 137
+Zwróćmy uwagę na kod powrotu: 137 > 128, co oznacza, że procesy zostały zakończone sygnałem (ustawiony
+najstarszy bit kodu powrotu)l; 137-128 = 9 co odpowiada sygnałowi SIG_KILL rutynowo używanemu do „łagodnego”
+zabijania procesów.
+Wprowadźmy teraz „zakłócenia” do transmisji datagramów. Użyjemy w tym celu narzędzia pozwalającego na zmianę
+polityki kolejkowania pakietów sieciowych w jądrze systemu operacyjnego Linux. Zastosujemy polecenie tc2
+wchodzące w skład pakietu iptables2, narzędzie to pozwala na zmianę tzw. polityki kolejkowania pakietów sieciowych
+(queuing discipline – qdisc), odwołamy się tu do mechanizmu netem (network emulator), który pozwala na
+wprowadzanie wszelkiego rodzaju anomalii (opóźnień, drżenia, gubienia, duplikacji pakietów). Zmiana polityki
+kolejkowania wymaga dodatkowych uprawnień − właśnie dlatego w pliku yaml dodano parametr NET_ADMIN .
+Przykład 28 – uruchamienie środowiska UDP z anomaliami wprowadzonymi przez netem. Aby zaobserowować
+anomalie zlecimy wysłanie kilkuset pakietów z odstępem czasowy 2000 ms między pakietami (wymaga to
+modyfikacji pliku dockerfile kontenera sink w sekcji CMD i ponownego zbudowania środowiska).
+gjb@maersk:~/compose_UDP$ docker-compose up
+. . .
+udp_source2 | -> #12
+udp_sink2 | recvfrom ok
+udp_sink2 | Received 500 bytes from udp_source2.compose_udp_default:50882
+udp_sink2 | Received counter = 12 time_delta = 0.84
+udp_sink2 | recvfrom ok
+udp_source2 | -> #13
+udp_sink2 | Received 500 bytes from udp_source2.compose_udp_default:50882
+udp_sink2 | Received counter = 13 time_delta = 0.75
+W tym momencie na drugiej konsoli uruchamiamy polecenie, "wstrzykiwane" do kontenera generującego dane:
+gjb@maersk:~/compose_UDP$ docker exec udp_source2 tc qdisc add dev eth0 root netem
+delay 1000ms 500ms loss 50%
+udp_source2 | -> #14
+udp_sink2 | recvfrom ok
+udp_sink2 | Received 500 bytes from udp_source2.compose_udp_default:50882
+udp_sink2 | Received counter = 14 time_delta = 1389.46
+udp_source2 | -> #15
+udp_source2 | -> #16
+udp_source2 | -> #17
+udp_sink2 | recvfrom ok
+udp_sink2 | Received 500 bytes from udp_source2.compose_udp_default:50882
+udp_sink2 | Received counter = 17 time_delta = 1166.03
+udp_source2 | -> #18
+udp_source2 | -> #19
+udp_sink2 | recvfrom ok
+udp_sink2 | Received 500 bytes from udp_source2.compose_udp_default:50882
+udp_sink2 | Received counter = 19 time_delta = 1283.94
+udp_source2 | -> #20
+udp_sink2 | recvfrom ok
+udp_sink2 | Received 500 bytes from udp_source2.compose_udp_default:50882
+udp_sink2 | Received counter = 20 time_delta = 1415.76
+Polecenie „docker exec” uruchamia wskazany program w działającym kontenerze. W powyższym przykładzie jest to
+program tc, który dla interfejsu sieciowego eth0 ustala parametry emulatora netem: opóźnienie 1000 ms z rozrzutem
+(jitter) 500 ms i prawdopodobieństwem „zagubienia” pakietu równym 50%. Obserwując wyświetlane przez odbiorcę
+numery odebranych pakietów oraz opóźnienia czasowe rzeczywiście można potwierdzić, że sieć kontenerowa zmieniła
+swoje zachowanie na dużo bardziej niedeterministyczne.
+Uwaga – Przy kilku kontenerach działających jednocześnie, interpretacja wyświetlanych wyników może stać się
+trudna. W takim przypadku można zrezygnować z interaktywności kontenerów i posłużyć się poleceniem „docker logs
+–follow <nazwa-kontenera>” − pozwala ono na wyświetlenie w czasie rzeczywistym komunikatów generowanych
+przez zadany kontener.

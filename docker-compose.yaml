@@ -9,7 +9,7 @@ services:
     tty: false
     environment:
       - PYTHONUNBUFFERED=1
-    networks: [psinet]
+    networks: [z78_network]
 
   peer1:
     container_name: t_peer1
@@ -26,7 +26,7 @@ services:
       - PYTHONUNBUFFERED=1
     volumes:
       - ./_data/peer1:/data
-    networks: [psinet]
+    networks: [z78_network]
     depends_on: [tracker]
 
   peer2:
@@ -44,7 +44,7 @@ services:
       - PYTHONUNBUFFERED=1
     volumes:
       - ./_data/peer2:/data
-    networks: [psinet]
+    networks: [z78_network]
     depends_on: [tracker]
 
   peer3:
@@ -62,9 +62,9 @@ services:
       - PYTHONUNBUFFERED=1
     volumes:
       - ./_data/peer3:/data
-    networks: [psinet]
+    networks: [z78_network]
     depends_on: [tracker]
 
 networks:
-  psinet:
+  z78_network:
     external: true

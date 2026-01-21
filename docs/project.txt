@@ -1,0 +1,40 @@
+Zespół Z78
+
+oto treść zadania projektowego:
+
+Zaprojektować i zaimplementować rozwiązanie dla prostej sieci "torrentopodobnej" - pozwalające na skoordynowane ale i rozproszone przesyłanie plików w sposób zbliżony do tego, jak odbywa się to w rzeczywistych tego rodzaju sieciach.
+
+Nieuporządkowane hasła kluczowe:
+     • koordynator, przechowujący informacje o lokalizacjach,  które przechowują określony plik
+     • raportowanie koordynatorowi udostępnianego pliku
+     • informowanie przez koordynatora o lokalizacjach, w których przechowywany jest plik
+     • równoległe pobieranie pliku w niewielkich fragmentach z różnych lokalizacji
+     • jednoczesne udostępnianie pliku (w całości lub fragmentach)
+     • proste sterowanie/raporty/statystyki
+
+Zwracam uwagę na to, że zadania projektowe sformułowane są raczej hasłowo. Zachęcam do konsultacji osobistych, żeby rozwiać ew. 
+wątpliwości. Najlepszymi dla mnie ich terminami byłyby np.:
+cz 2025-12-11, 12-14, pok. 309
+śr 2025-12-17, 09-16, lab. 8a
+cz 2025-12-11, 09-14, lab. 139
+
+
+Projekt wstępny                2025-12-23
+     • Założenia
+     • Zakres realizacji
+     • Przypadki użycia
+     • Architektura
+     • Obsługa sytuacji błędnych
+     • Przypadki testowe
+     • Podział prac w zespole
+     • Scenariusz demonstracji
+
+Projekt końcowy wraz z demonstracją:    2026-01-22
+     • Opis projektu i implementacji
+     • Scenariusze komunikacji
+     • Definicje komunikatów
+     • Opisy zachowania podmiotów komunikacji
+     • Wyniki testów
+     • Podsumowanie
+
+Z wyrazami szacunku,

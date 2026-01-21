@@ -9,13 +9,11 @@ OUT2_DIR="${ROOT_DIR}/_data/peer2"
 OUT1="${OUT1_DIR}/example.bin"
 OUT2="${OUT2_DIR}/example.bin"
 
-# Must match T_CHUNK_SIZE in common/proto.h
+# T_CHUNK_SIZE in common/proto.h
 CHUNK=4096
 
-# Choose two different prefix sizes (will be aligned down to CHUNK).
-# Keep PEER2 larger than PEER1 so they announce different bitmaps.
-PEER1_BYTES=$((16 * 1024))   # 64 KiB
-PEER2_BYTES=$((128 * 1024))  # 128 KiB
+PEER1_BYTES=$((16 * 1024))
+PEER2_BYTES=$((128 * 1024))
 
 if [[ ! -f "$MASTER" ]]; then
   echo "missing master file: $MASTER" >&2
