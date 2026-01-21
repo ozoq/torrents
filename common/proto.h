@@ -5,7 +5,6 @@
 #define T_MAX_LINE 4096
 #define T_CHUNK_SIZE 4096
 
-// --- camelCase API ---
 int tWriteAll(int fd, const void *buffer, size_t byteCount);
 int tReadLine(int fd, char *output, size_t outputSize); /* returns bytes, 0 on EOF, -1 on error */
 int tConnectTcp(const char *host, const char *port);
