@@ -67,10 +67,6 @@ assertFileHashEquals() {
   [ "$seedHash" = "$outHash" ] || fail "hash mismatch"
 }
 
-ensureNetwork() {
-  docker network inspect psinet >/dev/null 2>&1 || docker network create psinet >/dev/null
-}
-
 runGetCapture() {
   local outFile="$1"; shift
   local container="$1"; shift
@@ -106,7 +102,6 @@ testHappyPathSingleSeed() {
 testHappyPathMultiSeed() {
   echo "== testHappyPathMultiSeed =="
   cleanAll
-  ensureNetwork
   prepareData multiSeed 400000
   buildImages
   upBase
@@ -150,7 +145,7 @@ testBadBitmap() {
   upBase
 
   # use a small netcat container on same network and send a broken ANNOUNCE (bitmap length wrong)
-  docker run --rm --network psinet alpine:3.19 sh -lc "
+  docker run --rm --network z78_network alpine:3.19 sh -lc "
     apk add --no-cache netcat-openbsd >/dev/null
     printf 'ANNOUNCE 5555 example.bin 1048576 1048576 4096 deadbeef\n' | nc -w 2 t_tracker 9000
   " > "$ROOT_DIR/tests/_badBitmap.out" 2>&1 || true
@@ -224,14 +219,14 @@ testBadDataSizeFromSeed() {
   buildImages
   upBase
 
-  # start fake seed server as separate container on psinet
-  docker run -d --rm --name t_fake_seed --network psinet \
+  # start fake seed server as separate container on z78_network
+  docker run -d --rm --name t_fake_seed --network z78_network \
     -v "$ROOT_DIR/tests:/tests:ro" python:3.11-alpine \
     python /tests/fake-seed.py 10009 >/dev/null
 
   # announce fake seed with bitmap that claims it has everything (all 1 bits)
   # it is ok if it is not perfect, we just want client to try it and then reject bad DATA size
-  docker run --rm --network psinet alpine:3.19 sh -lc "
+  docker run --rm --network z78_network alpine:3.19 sh -lc "
     apk add --no-cache netcat-openbsd >/dev/null
     printf 'ANNOUNCE 10009 example.bin 1048576 1048576 4096 ' > /tmp/a
     # bitmap bytes for 1048576/4096=256 chunks => 32 bytes => 64 hex chars
