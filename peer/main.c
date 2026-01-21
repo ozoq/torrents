@@ -44,10 +44,12 @@ typedef struct {
     pthread_mutex_t mutex;
 } DownloadJob;
 
+// clearBit - clear one bit in bitfield by masking that bit out
 static void clearBit(uint8_t *bitfield, size_t bitIndex) {
     bitfield[bitIndex / 8] &= (uint8_t)~(1u << (bitIndex % 8));
 }
 
+// getFileSizeBytes - use stat to get file size and put it to outSizeBytes
 static int getFileSizeBytes(const char *path, size_t *outSizeBytes) {
     struct stat st;
     if (stat(path, &st) != 0) return -1;
@@ -55,6 +57,7 @@ static int getFileSizeBytes(const char *path, size_t *outSizeBytes) {
     return 0;
 }
 
+// buildBitfieldForLocalFile - look at file size and mark chunks we already have
 static int buildBitfieldForLocalFile(const char *path, size_t totalSizeBytes, size_t chunkSizeBytes,
                                      uint8_t *outBitfield, size_t outBitfieldBytes) {
     (void)outBitfieldBytes;
@@ -75,6 +78,7 @@ static int buildBitfieldForLocalFile(const char *path, size_t totalSizeBytes, si
     return 0;
 }
 
+// announceToTracker - build bitfield then send ANNOUNCE to tracker and read OK or ERR
 static int announceToTracker(const char *trackerHost, const char *trackerPort,
                             int peerPort, const char *fileName, const char *path,
                             size_t chunkSizeBytes, size_t totalSizeBytes) {
@@ -123,7 +127,9 @@ static int announceToTracker(const char *trackerHost, const char *trackerPort,
     return -1;
 }
 
+// queryTracker - send QUERY to tracker then read peers list and save it into job
 static int queryTracker(DownloadJob *job, const char *trackerHost, const char *trackerPort) {
+    // step 1 connect and send QUERY
     int fd = tConnectTcp(trackerHost, trackerPort);
     if (fd < 0) { tPerr("peer", "connect tracker (query)"); return -1; }
 
@@ -135,6 +141,7 @@ static int queryTracker(DownloadJob *job, const char *trackerHost, const char *t
     if (tReadLine(fd, line, sizeof line) <= 0) { tPerr("peer", "read tracker (query hdr)"); close(fd); return -1; }
     if (strncmp(line, "PEERS ", 6) != 0) { tLog("peer", "QUERY unexpected: %s", line); close(fd); return -1; }
 
+    // step 2 read header and allocate job bitfields
     int advertisedPeerCount = 0;
     if (sscanf(line, "PEERS %*s %zu %zu %d", &job->totalSizeBytes, &job->chunkSizeBytes, &advertisedPeerCount) != 3) {
         close(fd);
@@ -148,6 +155,7 @@ static int queryTracker(DownloadJob *job, const char *trackerHost, const char *t
 
     size_t bitfieldBytes = tBitmapByteCount(job->chunkCount);
 
+    // step 3 read each peer row and decode bitmap
     job->peerCount = 0;
     for (int i = 0; i < advertisedPeerCount && i < MAX_PEERS; i++) {
         if (tReadLine(fd, line, sizeof line) <= 0) break;
@@ -183,84 +191,85 @@ static int queryTracker(DownloadJob *job, const char *trackerHost, const char *t
     return (job->peerCount > 0) ? 0 : -1;
 }
 
-static int serve_one(int cfd, const char *data_dir) {
+// serveOne - read GET request then read chunk from disk and reply with DATA
+static int serveOne(int clientFd, const char *dataDir) {
     char line[T_MAX_LINE];
-    if (tReadLine(cfd, line, sizeof line) <= 0) return -1;
+    if (tReadLine(clientFd, line, sizeof line) <= 0) return -1;
 
-    char file[MAX_FILE];
-    long idx = -1;
-    size_t chunk_size = 0;
+    char fileName[MAX_FILE];
+    long chunkIndex = -1;
+    size_t chunkSizeBytes = 0;
 
-    // NEW protocol: GET <file> <idx> <chunk_size>\n
-    if (sscanf(line, "GET %255s %ld %zu", file, &idx, &chunk_size) == 3) {
-        if (idx < 0 || chunk_size == 0) {
-            tWriteAll(cfd, "ERR bad_get\n", 12);
+    if (sscanf(line, "GET %255s %ld %zu", fileName, &chunkIndex, &chunkSizeBytes) == 3) {
+        if (chunkIndex < 0 || chunkSizeBytes == 0) {
+            tWriteAll(clientFd, "ERR bad_get\n", 12);
             return -1;
         }
     } else {
-        // Back-compat: old protocol GET <file> <idx>\n (uses T_CHUNK_SIZE)
-        if (sscanf(line, "GET %255s %ld", file, &idx) != 2 || idx < 0) {
+        if (sscanf(line, "GET %255s %ld", fileName, &chunkIndex) != 2 || chunkIndex < 0) {
             tLog("peer", "serve: bad request: %s", line);
-            tWriteAll(cfd, "ERR bad_get\n", 12);
+            tWriteAll(clientFd, "ERR bad_get\n", 12);
             return -1;
         }
-        chunk_size = (size_t)T_CHUNK_SIZE;
+        chunkSizeBytes = (size_t)T_CHUNK_SIZE;
     }
 
-    tLog("peer", "serve: GET file=%s chunk=%ld chunk_size=%zu", file, idx, chunk_size);
+    tLog("peer", "serve: GET file=%s chunk=%ld chunk_size=%zu", fileName, chunkIndex, chunkSizeBytes);
 
     char path[768];
-    snprintf(path, sizeof path, "%s/%s", data_dir, file);
+    snprintf(path, sizeof path, "%s/%s", dataDir, fileName);
 
     FILE *f = fopen(path, "rb");
-    if (!f) { tWriteAll(cfd, "ERR no_file\n", 12); return -1; }
+    if (!f) { tWriteAll(clientFd, "ERR no_file\n", 12); return -1; }
 
-    // Use requested chunk_size so offsets match the client/tracker
-    if (fseek(f, (long)((size_t)idx * chunk_size), SEEK_SET) != 0) {
+    if (fseek(f, (long)((size_t)chunkIndex * chunkSizeBytes), SEEK_SET) != 0) {
         fclose(f);
-        tWriteAll(cfd, "ERR seek\n", 9);
+        tWriteAll(clientFd, "ERR seek\n", 9);
         return -1;
     }
 
-    uint8_t *buf = (uint8_t*)malloc(chunk_size);
-    if (!buf) { fclose(f); tWriteAll(cfd, "ERR oom\n", 8); return -1; }
+    uint8_t *buf = (uint8_t*)malloc(chunkSizeBytes);
+    if (!buf) { fclose(f); tWriteAll(clientFd, "ERR oom\n", 8); return -1; }
 
-    size_t r = fread(buf, 1, chunk_size, f);
+    size_t bytesRead = fread(buf, 1, chunkSizeBytes, f);
     fclose(f);
 
-    tLog("peer", "serve: DATA nbytes=%zu file=%s chunk=%ld", r, file, idx);
+    tLog("peer", "serve: DATA nbytes=%zu file=%s chunk=%ld", bytesRead, fileName, chunkIndex);
 
-    char hdr[64];
-    int hn = snprintf(hdr, sizeof hdr, "DATA %zu\n", r);
-    if (tWriteAll(cfd, hdr, (size_t)hn) != 0) { free(buf); return -1; }
-    if (r && tWriteAll(cfd, buf, r) != 0) { free(buf); return -1; }
+    char header[64];
+    int headerBytes = snprintf(header, sizeof header, "DATA %zu\n", bytesRead);
+    if (tWriteAll(clientFd, header, (size_t)headerBytes) != 0) { free(buf); return -1; }
+    if (bytesRead && tWriteAll(clientFd, buf, bytesRead) != 0) { free(buf); return -1; }
 
     free(buf);
     return 0;
 }
 
-static void *serve_thread(void *arg) {
-    const char **a = (const char**)arg;
-    const char *listen_port = a[0];
-    const char *data_dir = a[1];
+// serveThread - listen tcp and accept clients then call serveOne
+static void *serveThread(void *arg) {
+    const char **args = (const char**)arg;
+    const char *listenPort = args[0];
+    const char *dataDir = args[1];
 
-    int lfd = tListenTcp("0.0.0.0", listen_port, BACKLOG);
-    if (lfd < 0) { perror("peer listen"); return NULL; }
+    int listenFd = tListenTcp("0.0.0.0", listenPort, BACKLOG);
+    if (listenFd < 0) { perror("peer listen"); return NULL; }
 
     for (;;) {
-        int cfd = accept(lfd, NULL, NULL);
-        if (cfd < 0) continue;
-        serve_one(cfd, data_dir);
-        close(cfd);
+        int clientFd = accept(listenFd, NULL, NULL);
+        if (clientFd < 0) continue;
+        serveOne(clientFd, dataDir);
+        close(clientFd);
     }
     return NULL;
 }
 
+// fetchChunk - connect to peer then GET chunk then write it to output file and mark have bit
 static int fetchChunk(DownloadJob *job, size_t chunkIndex, SeedPeer *peer, FILE *outFile) {
     int result = -1;
     int fd = -1;
     uint8_t *buffer = NULL;
 
+    // step 1 connect to peer and send GET chunk
     char portString[16];
     snprintf(portString, sizeof portString, "%d", peer->port);
 
@@ -273,6 +282,7 @@ static int fetchChunk(DownloadJob *job, size_t chunkIndex, SeedPeer *peer, FILE 
     int requestBytes = snprintf(request, sizeof request, "GET %s %zu %zu\n", job->fileName, chunkIndex, job->chunkSizeBytes);
     if (tWriteAll(fd, request, (size_t)requestBytes) != 0) goto cleanup;
 
+    // step 2 read DATA header and read bytes
     char line[T_MAX_LINE];
     if (tReadLine(fd, line, sizeof line) <= 0) goto cleanup;
 
@@ -302,6 +312,7 @@ static int fetchChunk(DownloadJob *job, size_t chunkIndex, SeedPeer *peer, FILE 
         offset += (size_t)r;
     }
 
+    // step 3 write to output file and mark chunk as done
     pthread_mutex_lock(&job->mutex);
 
     if (tBitmapGet(job->haveBitfield, chunkIndex)) {
@@ -325,6 +336,7 @@ static int fetchChunk(DownloadJob *job, size_t chunkIndex, SeedPeer *peer, FILE 
     result = 0;
 
 cleanup:
+    // step 4 always clear inflight bit and close/free
     pthread_mutex_lock(&job->mutex);
     if (job->inFlightBitfield) clearBit(job->inFlightBitfield, chunkIndex);
     pthread_mutex_unlock(&job->mutex);
@@ -334,6 +346,7 @@ cleanup:
     return result;
 }
 
+// pickSeedForChunk - pick random peer then go forward until find one that have this chunk
 static const SeedPeer *pickSeedForChunk(DownloadJob *job, size_t chunkIndex, unsigned workerId) {
     int startIndex = 0;
     if (job->peerCount > 0) startIndex = (int)((workerId + (unsigned)rand()) % (unsigned)job->peerCount);
@@ -347,6 +360,7 @@ static const SeedPeer *pickSeedForChunk(DownloadJob *job, size_t chunkIndex, uns
 
 typedef struct { DownloadJob *job; FILE *outFile; unsigned workerId; } WorkerArgs;
 
+// worker - pick next missing chunk then download it from some peer until all done or failed
 static void *worker(void *arg) {
     WorkerArgs *args = (WorkerArgs*)arg;
     DownloadJob *job = args->job;
@@ -354,6 +368,7 @@ static void *worker(void *arg) {
     for (;;) {
         size_t chosenChunk = (size_t)-1;
 
+        // step 1 pick a chunk we dont have and mark it inflight
         pthread_mutex_lock(&job->mutex);
         for (size_t i = 0; i < job->chunkCount; i++) {
             if (tBitmapGet(job->haveBitfield, i)) continue;
@@ -374,6 +389,7 @@ static void *worker(void *arg) {
 
         if (chosenChunk == (size_t)-1) break;
 
+        // step 2 check at least one peer have it
         pthread_mutex_lock(&job->mutex);
         int anyPeerHasChunk = 0;
         for (int p = 0; p < job->peerCount; p++) {
@@ -386,6 +402,7 @@ static void *worker(void *arg) {
             return NULL;
         }
 
+        // step 3 pick a peer and download this chunk
         const SeedPeer *chosenPeer = pickSeedForChunk(job, chosenChunk, args->workerId);
         if (!chosenPeer) { usleep(50 * 1000); continue; }
 
@@ -394,7 +411,9 @@ static void *worker(void *arg) {
     return NULL;
 }
 
+// cmdGet - query tracker then start workers and wait then check all chunks are downloaded
 static int cmdGet(const char *trackerHost, const char *trackerPort, const char *fileName, const char *outPath) {
+    // step 1 query tracker
     tLog("peer", "GET start file=%s out=%s tracker=%s:%s", fileName, outPath, trackerHost, trackerPort);
 
     srand((unsigned)time(NULL) ^ (unsigned)getpid());
@@ -406,6 +425,7 @@ static int cmdGet(const char *trackerHost, const char *trackerPort, const char *
 
     if (queryTracker(&job, trackerHost, trackerPort) != 0) { tLog("peer", "GET: query failed"); return -1; }
 
+    // step 2 open output file and mark already have chunks if file exists
     struct stat st;
     int fileExists = (stat(outPath, &st) == 0);
 
@@ -431,6 +451,7 @@ static int cmdGet(const char *trackerHost, const char *trackerPort, const char *
         tLog("peer", "GET resume: already_have_bytes=%zu already_have_chunks=%zu", haveSizeBytes, haveChunks);
     }
 
+    // step 3 start worker threads and wait
     pthread_t threads[WORKERS];
     WorkerArgs workerArgs[WORKERS];
     for (unsigned i = 0; i < WORKERS; i++) {
@@ -441,6 +462,7 @@ static int cmdGet(const char *trackerHost, const char *trackerPort, const char *
     }
     for (unsigned i = 0; i < WORKERS; i++) pthread_join(threads[i], NULL);
 
+    // step 4 check all chunks done and print summary
     int complete = 1;
     pthread_mutex_lock(&job.mutex);
     for (size_t i = 0; i < job.chunkCount; i++) {
@@ -468,6 +490,7 @@ static int cmdGet(const char *trackerHost, const char *trackerPort, const char *
     return 0;
 }
 
+// cmdSeed - make file path then call announceToTracker
 static int cmdSeed(const char *trackerHost, const char *trackerPort, int listenPort,
                    const char *dataDir, const char *fileName, size_t fullSizeBytes) {
     const size_t chunkSizeBytes = (size_t)T_CHUNK_SIZE;
@@ -476,51 +499,51 @@ static int cmdSeed(const char *trackerHost, const char *trackerPort, int listenP
     return announceToTracker(trackerHost, trackerPort, listenPort, fileName, path, chunkSizeBytes, fullSizeBytes);
 }
 
+// main - read env then run serve or seed or get or default mode
 int main(int argc, char **argv) {
-    const char *tracker_host = getenv("TRACKER_HOST");
-    const char *tracker_port = getenv("TRACKER_PORT");
-    const char *listen_port = getenv("LISTEN_PORT");
-    const char *data_dir = getenv("DATA_DIR");
-    if (!tracker_host) tracker_host = "t_tracker";
-    if (!tracker_port) tracker_port = "9000";
-    if (!listen_port) listen_port = "10001";
-    if (!data_dir) data_dir = "/data";
+    const char *trackerHost = getenv("TRACKER_HOST");
+    const char *trackerPort = getenv("TRACKER_PORT");
+    const char *listenPort = getenv("LISTEN_PORT");
+    const char *dataDir = getenv("DATA_DIR");
+    if (!trackerHost) trackerHost = "t_tracker";
+    if (!trackerPort) trackerPort = "9000";
+    if (!listenPort) listenPort = "10001";
+    if (!dataDir) dataDir = "/data";
 
     if (argc >= 2 && strcmp(argv[1], "serve") == 0) {
-        const char *args[2] = { listen_port, data_dir };
+        const char *args[2] = { listenPort, dataDir };
         pthread_t t;
-        pthread_create(&t, NULL, serve_thread, (void*)args);
+        pthread_create(&t, NULL, serveThread, (void*)args);
         pthread_join(t, NULL);
         return 0;
     }
 
     if (argc >= 2 && strcmp(argv[1], "seed") == 0) {
         if (argc < 3) { fprintf(stderr, "usage: tpeer seed <file> [full_size_bytes]\n"); return 2; }
-        size_t full_size = 0;
-        if (argc >= 4) full_size = (size_t)strtoull(argv[3], NULL, 10);
-        int lp = atoi(listen_port);
-        return cmdSeed(tracker_host, tracker_port, lp, data_dir, argv[2], full_size) == 0 ? 0 : 1;
+        size_t fullSizeBytes = 0;
+        if (argc >= 4) fullSizeBytes = (size_t)strtoull(argv[3], NULL, 10);
+        int listenPortNumber = atoi(listenPort);
+        return cmdSeed(trackerHost, trackerPort, listenPortNumber, dataDir, argv[2], fullSizeBytes) == 0 ? 0 : 1;
     }
 
     if (argc >= 2 && strcmp(argv[1], "get") == 0) {
         if (argc < 4) { fprintf(stderr, "usage: tpeer get <file> <outpath>\n"); return 2; }
-        return cmdGet(tracker_host, tracker_port, argv[2], argv[3]) == 0 ? 0 : 1;
+        return cmdGet(trackerHost, trackerPort, argv[2], argv[3]) == 0 ? 0 : 1;
     }
 
-    // default: run server + periodic announce of all files in /data (simple: announce one optional SEED_FILE)
-    const char *seed_file = getenv("SEED_FILE");
-    pthread_t t;
-    const char *args[2] = { listen_port, data_dir };
-    pthread_create(&t, NULL, serve_thread, (void*)args);
+    const char *seedFile = getenv("SEED_FILE");
+    pthread_t serverThread;
+    const char *args[2] = { listenPort, dataDir };
+    pthread_create(&serverThread, NULL, serveThread, (void*)args);
 
-    if (seed_file && seed_file[0]) {
-        int lp = atoi(listen_port);
+    if (seedFile && seedFile[0]) {
+        int listenPortNumber = atoi(listenPort);
         for (;;) {
-            cmdSeed(tracker_host, tracker_port, lp, data_dir, seed_file, 0);
+            cmdSeed(trackerHost, trackerPort, listenPortNumber, dataDir, seedFile, 0);
             sleep(2);
         }
     }
 
-    pthread_join(t, NULL);
+    pthread_join(serverThread, NULL);
     return 0;
 }

@@ -33,6 +33,7 @@ typedef struct {
 static FileEntry g_files[MAX_FILES];
 static int g_fileCount = 0;
 
+// getFileEntry - find file by name or create new entry
 static FileEntry *getFileEntry(const char *name) {
     for (int i = 0; i < g_fileCount; i++) {
         if (strcmp(g_files[i].name, name) == 0) return &g_files[i];
@@ -45,6 +46,7 @@ static FileEntry *getFileEntry(const char *name) {
     return entry;
 }
 
+// getPeerForFile - find peer by ip and port or create new peer record
 static PeerInfo *getPeerForFile(FileEntry *fileEntry, const char *ip, int port) {
     for (int i = 0; i < fileEntry->peerCount; i++) {
         if (strcmp(fileEntry->peers[i].ip, ip) == 0 && fileEntry->peers[i].port == port) {
@@ -60,12 +62,13 @@ static PeerInfo *getPeerForFile(FileEntry *fileEntry, const char *ip, int port) 
     return peer;
 }
 
+// handleClient - read one line then handle ANNOUNCE or QUERY and send reply
 static void handleClient(int clientFd, const char *remoteIp) {
     char line[T_MAX_LINE];
     int bytesRead = tReadLine(clientFd, line, sizeof line);
     if (bytesRead <= 0) return;
 
-    // ANNOUNCE <peer_port> <file> <full_size> <have_size> <chunk_size> <hex_bitmap>\n
+    // step 1 read command and parse it
     if (strncmp(line, "ANNOUNCE ", 9) == 0) {
         int peerPort = 0;
         char fileName[MAX_NAME];
@@ -81,10 +84,10 @@ static void handleClient(int clientFd, const char *remoteIp) {
             return;
         }
 
+        // step 2 find file entry and check file meta match
         FileEntry *fileEntry = getFileEntry(fileName);
         if (!fileEntry) { tWriteAll(clientFd, "ERR file_table_full\n", 20); return; }
 
-        // Canonical torrent params are (full_size, chunk_size)
         if (fileEntry->totalSizeBytes == 0) {
             fileEntry->totalSizeBytes = (size_t)fullSizeBytes;
             fileEntry->chunkSizeBytes = (size_t)chunkSizeBytes;
@@ -102,6 +105,7 @@ static void handleClient(int clientFd, const char *remoteIp) {
             }
         }
 
+        // step 3 find peer record and store peer bitmap
         PeerInfo *peer = getPeerForFile(fileEntry, remoteIp, peerPort);
         if (!peer) { tWriteAll(clientFd, "ERR peer_table_full\n", 20); return; }
 
@@ -116,6 +120,7 @@ static void handleClient(int clientFd, const char *remoteIp) {
             return;
         }
 
+        // step 4 reply OK
         tLog("tracker", "ANNOUNCE from %s:%d file=%s full=%zu have=%zu chunk=%zu peers_now=%d",
               remoteIp, peerPort, fileEntry->name, fileEntry->totalSizeBytes, (size_t)haveSizeBytes,
               fileEntry->chunkSizeBytes, fileEntry->peerCount);
@@ -124,8 +129,8 @@ static void handleClient(int clientFd, const char *remoteIp) {
         return;
     }
 
-    // QUERY <file>\n
     if (strncmp(line, "QUERY ", 6) == 0) {
+        // step 1 parse file name
         char fileName[MAX_NAME];
         if (sscanf(line, "QUERY %255s", fileName) != 1) {
             tLog("tracker", "QUERY from %s: bad query line", remoteIp);
@@ -133,6 +138,7 @@ static void handleClient(int clientFd, const char *remoteIp) {
             return;
         }
 
+        // step 2 find file entry
         FileEntry *fileEntry = NULL;
         for (int i = 0; i < g_fileCount; i++) {
             if (strcmp(g_files[i].name, fileName) == 0) { fileEntry = &g_files[i]; break; }
@@ -143,6 +149,7 @@ static void handleClient(int clientFd, const char *remoteIp) {
             return;
         }
 
+        // step 3 send peers header then send each peer row
         tLog("tracker", "QUERY from %s file=%s: returning %d peers", remoteIp, fileEntry->name, fileEntry->peerCount);
 
         char header[256];
@@ -167,6 +174,7 @@ static void handleClient(int clientFd, const char *remoteIp) {
     tWriteAll(clientFd, "ERR unknown_cmd\n", 16);
 }
 
+// main - listen on tcp port then accept clients and handle one request per connection
 int main(int argc, char **argv) {
     const char *portString = (argc >= 2) ? argv[1] : "9000";
     int listenFd = tListenTcp("0.0.0.0", portString, BACKLOG);
