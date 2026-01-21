@@ -2,6 +2,7 @@ version: "3.0"
 
 services:
   tracker:
+    image: z78_tracker
     container_name: z78_tracker
     build:
       context: .
@@ -12,6 +13,7 @@ services:
     networks: [z78_network]
 
   peer1:
+    image: z78_peer1
     container_name: z78_peer1
     build:
       context: .
@@ -30,6 +32,7 @@ services:
     depends_on: [tracker]
 
   peer2:
+    image: z78_peer2
     container_name: z78_peer2
     build:
       context: .
@@ -48,6 +51,7 @@ services:
     depends_on: [tracker]
 
   peer3:
+    image: z78_peer3
     container_name: z78_peer3
     build:
       context: .
