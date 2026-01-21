@@ -1,0 +1,10 @@
+FROM gcc:4.9
+WORKDIR /app
+
+# was: COPY . /app/torrents/peer
+COPY ./peer /app/torrents/peer
+# was: COPY ../common /app/torrents/common
+COPY ./common /app/torrents/common
+
+RUN gcc -std=gnu11 -O2 -Wall -Wextra -pthread -o /app/tpeer /app/torrents/peer/main.c /app/torrents/common/proto.c
+CMD ["/app/tpeer", "serve"]

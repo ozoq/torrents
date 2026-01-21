@@ -1,0 +1,71 @@
+version: "3.0"
+
+services:
+  tracker:
+    container_name: t_tracker
+    build:
+      context: .
+      dockerfile: ./tracker/dockerfile
+    tty: false
+    environment:
+      - PYTHONUNBUFFERED=1
+    networks: [psinet]
+
+  peer1:
+    container_name: t_peer1
+    build:
+      context: .
+      dockerfile: ./peer/dockerfile
+    tty: false
+    environment:
+      - PEER_NAME=peer1
+      - TRACKER_HOST=t_tracker
+      - TRACKER_PORT=9000
+      - LISTEN_PORT=10001
+      - DATA_DIR=/data
+      - PYTHONUNBUFFERED=1
+      - SEED_FILE=example.bin
+    volumes:
+      - ./_data/peer1:/data
+    networks: [psinet]
+    depends_on: [tracker]
+
+  peer2:
+    container_name: t_peer2
+    build:
+      context: .
+      dockerfile: ./peer/dockerfile
+    tty: false
+    environment:
+      - PEER_NAME=peer2
+      - TRACKER_HOST=t_tracker
+      - TRACKER_PORT=9000
+      - LISTEN_PORT=10002
+      - DATA_DIR=/data
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./_data/peer2:/data
+    networks: [psinet]
+    depends_on: [tracker]
+
+  peer3:
+    container_name: t_peer3
+    build:
+      context: .
+      dockerfile: ./peer/dockerfile
+    tty: false
+    environment:
+      - PEER_NAME=peer3
+      - TRACKER_HOST=t_tracker
+      - TRACKER_PORT=9000
+      - LISTEN_PORT=10003
+      - DATA_DIR=/data
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./_data/peer3:/data
+    networks: [psinet]
+    depends_on: [tracker]
+
+networks:
+  psinet:
+    external: true
