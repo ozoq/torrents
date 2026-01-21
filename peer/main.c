@@ -19,148 +19,173 @@
 typedef struct {
     char ip[64];
     int port;
-    uint8_t *bm;
-    size_t bm_nbytes;
 
-    // NEW: simple stats to prove multi-peer download
-    size_t chunks_sent;
-    size_t bytes_sent;
-} seed;
+    uint8_t *bitfield;
+    size_t bitfieldBytes;
+
+    size_t chunksSent;
+    size_t bytesSent;
+} SeedPeer;
 
 typedef struct {
-    char file[MAX_FILE];
-    char outpath[512];
-    size_t size;
-    size_t chunk_size;
-    size_t nchunks;
-    seed peers[MAX_PEERS];
-    int npeers;
+    char fileName[MAX_FILE];
+    char outputPath[512];
 
-    uint8_t *have;
-    uint8_t *inflight;          // NEW: one worker per chunk at a time
-    pthread_mutex_t mu;
-} job;
+    size_t totalSizeBytes;
+    size_t chunkSizeBytes;
+    size_t chunkCount;
 
-static int file_size(const char *path, size_t *out) {
+    SeedPeer peers[MAX_PEERS];
+    int peerCount;
+
+    uint8_t *haveBitfield;
+    uint8_t *inFlightBitfield;
+
+    pthread_mutex_t mutex;
+} DownloadJob;
+
+static void clearBit(uint8_t *bitfield, size_t bitIndex) {
+    bitfield[bitIndex / 8] &= (uint8_t)~(1u << (bitIndex % 8));
+}
+
+static int getFileSizeBytes(const char *path, size_t *outSizeBytes) {
     struct stat st;
     if (stat(path, &st) != 0) return -1;
-    *out = (size_t)st.st_size;
+    *outSizeBytes = (size_t)st.st_size;
     return 0;
 }
 
-static int build_bitmap_for_file(const char *path, size_t size, size_t chunk_size, uint8_t *bm, size_t bm_nbytes) {
-    (void)bm_nbytes;
+static int buildBitfieldForLocalFile(const char *path, size_t totalSizeBytes, size_t chunkSizeBytes,
+                                     uint8_t *outBitfield, size_t outBitfieldBytes) {
+    (void)outBitfieldBytes;
 
-    // NEW: interpret "bytes present on disk" as "have chunks up to that point"
-    // This lets you create partial seed files (truncate/copy prefix) and show multi-peer downloading.
     struct stat st;
     if (stat(path, &st) != 0) return -1;
 
-    size_t have_size = (size_t)st.st_size;
-    if (have_size > size) have_size = size;
+    size_t haveSizeBytes = (size_t)st.st_size;
+    if (haveSizeBytes > totalSizeBytes) haveSizeBytes = totalSizeBytes;
 
-    // NEW: include last partial chunk if any bytes exist for it
-    size_t have_chunks = 0;
-    if (chunk_size) {
-        have_chunks = have_size / chunk_size;
-        if ((have_size % chunk_size) != 0) have_chunks += 1;
+    size_t haveChunks = 0;
+    if (chunkSizeBytes) {
+        haveChunks = haveSizeBytes / chunkSizeBytes;
+        if ((haveSizeBytes % chunkSizeBytes) != 0) haveChunks += 1;
     }
 
-    for (size_t i = 0; i < have_chunks; i++) t_bitmap_set(bm, i);
+    for (size_t i = 0; i < haveChunks; i++) tBitmapSet(outBitfield, i);
     return 0;
 }
 
-static int announce(const char *tracker_host, const char *tracker_port,
-                    int peer_port, const char *file, const char *path,
-                    size_t chunk_size, size_t full_size) {
-    size_t have_size = 0;
-    if (file_size(path, &have_size) != 0) return -1;
+static int announceToTracker(const char *trackerHost, const char *trackerPort,
+                            int peerPort, const char *fileName, const char *path,
+                            size_t chunkSizeBytes, size_t totalSizeBytes) {
+    size_t haveSizeBytes = 0;
+    if (getFileSizeBytes(path, &haveSizeBytes) != 0) return -1;
 
-    if (full_size == 0) full_size = have_size;
+    if (totalSizeBytes == 0) totalSizeBytes = haveSizeBytes;
 
-    size_t nchunks = (full_size + chunk_size - 1)/chunk_size;
-    size_t bm_nbytes = t_bitmap_nbytes(nchunks);
-    uint8_t *bm = (uint8_t*)calloc(bm_nbytes ? bm_nbytes : 1, 1);
-    if (!bm) return -1;
+    size_t chunkCount = (totalSizeBytes + chunkSizeBytes - 1) / chunkSizeBytes;
+    size_t bitfieldBytes = tBitmapByteCount(chunkCount);
 
-    // bitmap represents what we have on disk, capped by full_size, but encoded for full_size
-    if (build_bitmap_for_file(path, full_size, chunk_size, bm, bm_nbytes) != 0) { free(bm); return -1; }
+    uint8_t *bitfield = (uint8_t*)calloc(bitfieldBytes ? bitfieldBytes : 1, 1);
+    if (!bitfield) return -1;
 
-    char hex[T_MAX_LINE];
-    if (t_hex_encode(bm, bm_nbytes, hex, sizeof hex) != 0) { free(bm); return -1; }
-    free(bm);
+    if (buildBitfieldForLocalFile(path, totalSizeBytes, chunkSizeBytes, bitfield, bitfieldBytes) != 0) {
+        free(bitfield);
+        return -1;
+    }
 
-    int fd = t_connect_tcp(tracker_host, tracker_port);
-    if (fd < 0) { t_perr("peer", "connect tracker (announce)"); return -1; }
+    char hexBitfield[T_MAX_LINE];
+    if (tHexEncode(bitfield, bitfieldBytes, hexBitfield, sizeof hexBitfield) != 0) {
+        free(bitfield);
+        return -1;
+    }
+    free(bitfield);
+
+    int fd = tConnectTcp(trackerHost, trackerPort);
+    if (fd < 0) { tPerr("peer", "connect tracker (announce)"); return -1; }
 
     char msg[T_MAX_LINE];
-    // NEW: include full_size + have_size
-    int n = snprintf(msg, sizeof msg, "ANNOUNCE %d %s %zu %zu %zu %s\n",
-                     peer_port, file, full_size, have_size, chunk_size, hex);
-    if (t_write_all(fd, msg, (size_t)n) != 0) { close(fd); return -1; }
+    int msgBytes = snprintf(msg, sizeof msg, "ANNOUNCE %d %s %zu %zu %zu %s\n",
+                            peerPort, fileName, totalSizeBytes, haveSizeBytes, chunkSizeBytes, hexBitfield);
+    if (tWriteAll(fd, msg, (size_t)msgBytes) != 0) { close(fd); return -1; }
 
     char line[T_MAX_LINE];
-    if (t_read_line(fd, line, sizeof line) <= 0) { t_perr("peer", "read tracker (announce)"); close(fd); return -1; }
+    if (tReadLine(fd, line, sizeof line) <= 0) { tPerr("peer", "read tracker (announce)"); close(fd); return -1; }
     close(fd);
 
     if (strncmp(line, "OK\n", 3) == 0) {
-        t_log("peer", "ANNOUNCE ok file=%s full_size=%zu have_size=%zu chunk=%zu", file, full_size, have_size, chunk_size);
+        tLog("peer", "ANNOUNCE ok file=%s full_size=%zu have_size=%zu chunk=%zu",
+              fileName, totalSizeBytes, haveSizeBytes, chunkSizeBytes);
         return 0;
     }
-    t_log("peer", "ANNOUNCE failed: %s", line);
+
+    tLog("peer", "ANNOUNCE failed: %s", line);
     return -1;
 }
 
-static int query(job *j, const char *tracker_host, const char *tracker_port) {
-    int fd = t_connect_tcp(tracker_host, tracker_port);
-    if (fd < 0) { t_perr("peer", "connect tracker (query)"); return -1; }
+static int queryTracker(DownloadJob *job, const char *trackerHost, const char *trackerPort) {
+    int fd = tConnectTcp(trackerHost, trackerPort);
+    if (fd < 0) { tPerr("peer", "connect tracker (query)"); return -1; }
 
-    char q[T_MAX_LINE];
-    int qn = snprintf(q, sizeof q, "QUERY %s\n", j->file);
-    if (t_write_all(fd, q, (size_t)qn) != 0) { close(fd); return -1; }
+    char queryLine[T_MAX_LINE];
+    int queryBytes = snprintf(queryLine, sizeof queryLine, "QUERY %s\n", job->fileName);
+    if (tWriteAll(fd, queryLine, (size_t)queryBytes) != 0) { close(fd); return -1; }
 
     char line[T_MAX_LINE];
-    if (t_read_line(fd, line, sizeof line) <= 0) { t_perr("peer", "read tracker (query hdr)"); close(fd); return -1; }
-    if (strncmp(line, "PEERS ", 6) != 0) { t_log("peer", "QUERY unexpected: %s", line); close(fd); return -1; }
+    if (tReadLine(fd, line, sizeof line) <= 0) { tPerr("peer", "read tracker (query hdr)"); close(fd); return -1; }
+    if (strncmp(line, "PEERS ", 6) != 0) { tLog("peer", "QUERY unexpected: %s", line); close(fd); return -1; }
 
-    int npeers = 0;
-    if (sscanf(line, "PEERS %*s %zu %zu %d", &j->size, &j->chunk_size, &npeers) != 3) { close(fd); return -1; }
-    j->nchunks = (j->size + j->chunk_size - 1)/j->chunk_size;
-    j->have = t_bitmap_alloc(j->nchunks);
-    j->inflight = t_bitmap_alloc(j->nchunks); // NEW
-    pthread_mutex_init(&j->mu, NULL);
+    int advertisedPeerCount = 0;
+    if (sscanf(line, "PEERS %*s %zu %zu %d", &job->totalSizeBytes, &job->chunkSizeBytes, &advertisedPeerCount) != 3) {
+        close(fd);
+        return -1;
+    }
 
-    size_t bm_nbytes = t_bitmap_nbytes(j->nchunks);
+    job->chunkCount = (job->totalSizeBytes + job->chunkSizeBytes - 1) / job->chunkSizeBytes;
+    job->haveBitfield = tBitmapAlloc(job->chunkCount);
+    job->inFlightBitfield = tBitmapAlloc(job->chunkCount);
+    pthread_mutex_init(&job->mutex, NULL);
 
-    j->npeers = 0;
-    for (int i=0; i<npeers && i<MAX_PEERS; i++) {
-        if (t_read_line(fd, line, sizeof line) <= 0) break;
+    size_t bitfieldBytes = tBitmapByteCount(job->chunkCount);
+
+    job->peerCount = 0;
+    for (int i = 0; i < advertisedPeerCount && i < MAX_PEERS; i++) {
+        if (tReadLine(fd, line, sizeof line) <= 0) break;
         if (strncmp(line, "P ", 2) != 0) continue;
 
-        char ip[64], hex[T_MAX_LINE];
+        char ip[64];
+        char hexBitfield[T_MAX_LINE];
         int port = 0;
-        if (sscanf(line, "P %63s %d %4095s", ip, &port, hex) != 3) continue;
+        if (sscanf(line, "P %63s %d %4095s", ip, &port, hexBitfield) != 3) continue;
 
-        seed *s = &j->peers[j->npeers++];
-        memset(s, 0, sizeof *s);
-        strncpy(s->ip, ip, sizeof(s->ip)-1);
-        s->port = port;
-        s->bm_nbytes = bm_nbytes;
-        s->bm = (uint8_t*)calloc(bm_nbytes ? bm_nbytes : 1, 1);
-        if (!s->bm) { close(fd); return -1; }
-        if (t_hex_decode(hex, s->bm, bm_nbytes) != 0) { t_log("peer", "bad peer bitmap from tracker"); close(fd); return -1; }
+        SeedPeer *peer = &job->peers[job->peerCount++];
+        memset(peer, 0, sizeof *peer);
+        strncpy(peer->ip, ip, sizeof(peer->ip) - 1);
+        peer->port = port;
 
-        t_log("peer", "seed[%d]=%s:%d", j->npeers - 1, s->ip, s->port);
+        peer->bitfieldBytes = bitfieldBytes;
+        peer->bitfield = (uint8_t*)calloc(bitfieldBytes ? bitfieldBytes : 1, 1);
+        if (!peer->bitfield) { close(fd); return -1; }
+
+        if (tHexDecode(hexBitfield, peer->bitfield, bitfieldBytes) != 0) {
+            tLog("peer", "bad peer bitmap from tracker");
+            close(fd);
+            return -1;
+        }
+
+        tLog("peer", "seed[%d]=%s:%d", job->peerCount - 1, peer->ip, peer->port);
     }
+
     close(fd);
-    t_log("peer", "QUERY file=%s -> size=%zu chunk=%zu nchunks=%zu npeers=%d",
-          j->file, j->size, j->chunk_size, j->nchunks, npeers);
-    return (j->npeers > 0) ? 0 : -1;
+    tLog("peer", "QUERY file=%s -> size=%zu chunk=%zu nchunks=%zu npeers=%d",
+          job->fileName, job->totalSizeBytes, job->chunkSizeBytes, job->chunkCount, advertisedPeerCount);
+
+    return (job->peerCount > 0) ? 0 : -1;
 }
 
 static int serve_one(int cfd, const char *data_dir) {
     char line[T_MAX_LINE];
-    if (t_read_line(cfd, line, sizeof line) <= 0) return -1;
+    if (tReadLine(cfd, line, sizeof line) <= 0) return -1;
 
     char file[MAX_FILE];
     long idx = -1;
@@ -169,46 +194,46 @@ static int serve_one(int cfd, const char *data_dir) {
     // NEW protocol: GET <file> <idx> <chunk_size>\n
     if (sscanf(line, "GET %255s %ld %zu", file, &idx, &chunk_size) == 3) {
         if (idx < 0 || chunk_size == 0) {
-            t_write_all(cfd, "ERR bad_get\n", 12);
+            tWriteAll(cfd, "ERR bad_get\n", 12);
             return -1;
         }
     } else {
         // Back-compat: old protocol GET <file> <idx>\n (uses T_CHUNK_SIZE)
         if (sscanf(line, "GET %255s %ld", file, &idx) != 2 || idx < 0) {
-            t_log("peer", "serve: bad request: %s", line);
-            t_write_all(cfd, "ERR bad_get\n", 12);
+            tLog("peer", "serve: bad request: %s", line);
+            tWriteAll(cfd, "ERR bad_get\n", 12);
             return -1;
         }
         chunk_size = (size_t)T_CHUNK_SIZE;
     }
 
-    t_log("peer", "serve: GET file=%s chunk=%ld chunk_size=%zu", file, idx, chunk_size);
+    tLog("peer", "serve: GET file=%s chunk=%ld chunk_size=%zu", file, idx, chunk_size);
 
     char path[768];
     snprintf(path, sizeof path, "%s/%s", data_dir, file);
 
     FILE *f = fopen(path, "rb");
-    if (!f) { t_write_all(cfd, "ERR no_file\n", 12); return -1; }
+    if (!f) { tWriteAll(cfd, "ERR no_file\n", 12); return -1; }
 
     // Use requested chunk_size so offsets match the client/tracker
     if (fseek(f, (long)((size_t)idx * chunk_size), SEEK_SET) != 0) {
         fclose(f);
-        t_write_all(cfd, "ERR seek\n", 9);
+        tWriteAll(cfd, "ERR seek\n", 9);
         return -1;
     }
 
     uint8_t *buf = (uint8_t*)malloc(chunk_size);
-    if (!buf) { fclose(f); t_write_all(cfd, "ERR oom\n", 8); return -1; }
+    if (!buf) { fclose(f); tWriteAll(cfd, "ERR oom\n", 8); return -1; }
 
     size_t r = fread(buf, 1, chunk_size, f);
     fclose(f);
 
-    t_log("peer", "serve: DATA nbytes=%zu file=%s chunk=%ld", r, file, idx);
+    tLog("peer", "serve: DATA nbytes=%zu file=%s chunk=%ld", r, file, idx);
 
     char hdr[64];
     int hn = snprintf(hdr, sizeof hdr, "DATA %zu\n", r);
-    if (t_write_all(cfd, hdr, (size_t)hn) != 0) { free(buf); return -1; }
-    if (r && t_write_all(cfd, buf, r) != 0) { free(buf); return -1; }
+    if (tWriteAll(cfd, hdr, (size_t)hn) != 0) { free(buf); return -1; }
+    if (r && tWriteAll(cfd, buf, r) != 0) { free(buf); return -1; }
 
     free(buf);
     return 0;
@@ -219,7 +244,7 @@ static void *serve_thread(void *arg) {
     const char *listen_port = a[0];
     const char *data_dir = a[1];
 
-    int lfd = t_listen_tcp("0.0.0.0", listen_port, BACKLOG);
+    int lfd = tListenTcp("0.0.0.0", listen_port, BACKLOG);
     if (lfd < 0) { perror("peer listen"); return NULL; }
 
     for (;;) {
@@ -231,231 +256,224 @@ static void *serve_thread(void *arg) {
     return NULL;
 }
 
-static int fetch_chunk(job *j, size_t chunk_idx, seed *s, FILE *out) {
-    int rc = -1;
+static int fetchChunk(DownloadJob *job, size_t chunkIndex, SeedPeer *peer, FILE *outFile) {
+    int result = -1;
     int fd = -1;
-    uint8_t *buf = NULL;
+    uint8_t *buffer = NULL;
 
-    char portstr[16];
-    snprintf(portstr, sizeof portstr, "%d", s->port);
+    char portString[16];
+    snprintf(portString, sizeof portString, "%d", peer->port);
 
-    t_log("peer", "fetch: chunk=%zu from %s:%d", chunk_idx, s->ip, s->port);
+    tLog("peer", "fetch: chunk=%zu from %s:%d", chunkIndex, peer->ip, peer->port);
 
-    fd = t_connect_tcp(s->ip, portstr);
-    if (fd < 0) { t_perr("peer", "connect seed"); goto cleanup; }
+    fd = tConnectTcp(peer->ip, portString);
+    if (fd < 0) { tPerr("peer", "connect seed"); goto cleanup; }
 
-    char msg[T_MAX_LINE];
-    int mn = snprintf(msg, sizeof msg, "GET %s %zu %zu\n", j->file, chunk_idx, j->chunk_size);
-    if (t_write_all(fd, msg, (size_t)mn) != 0) goto cleanup;
+    char request[T_MAX_LINE];
+    int requestBytes = snprintf(request, sizeof request, "GET %s %zu %zu\n", job->fileName, chunkIndex, job->chunkSizeBytes);
+    if (tWriteAll(fd, request, (size_t)requestBytes) != 0) goto cleanup;
 
     char line[T_MAX_LINE];
-    if (t_read_line(fd, line, sizeof line) <= 0) goto cleanup;
+    if (tReadLine(fd, line, sizeof line) <= 0) goto cleanup;
 
-    size_t nbytes = 0;
-    if (sscanf(line, "DATA %zu", &nbytes) != 1) goto cleanup;
+    size_t receivedBytes = 0;
+    if (sscanf(line, "DATA %zu", &receivedBytes) != 1) goto cleanup;
 
-    // Determine expected size for this chunk (last chunk may be smaller)
-    size_t expected = j->chunk_size;
-    if (chunk_idx + 1 == j->nchunks) {
-        size_t rem = j->size - (chunk_idx * j->chunk_size);
-        if (rem < expected) expected = rem;
+    size_t expectedBytes = job->chunkSizeBytes;
+    if (chunkIndex + 1 == job->chunkCount) {
+        size_t remaining = job->totalSizeBytes - (chunkIndex * job->chunkSizeBytes);
+        if (remaining < expectedBytes) expectedBytes = remaining;
     }
 
-    // If peer returns 0 or more than expected, treat as "peer can't serve this chunk"
-    if (nbytes == 0 || nbytes > expected) {
-        pthread_mutex_lock(&j->mu);
-        if (s->bm) s->bm[chunk_idx/8] &= (uint8_t)~(1u << (chunk_idx % 8));
-        pthread_mutex_unlock(&j->mu);
+    if (receivedBytes == 0 || receivedBytes > expectedBytes) {
+        pthread_mutex_lock(&job->mutex);
+        if (peer->bitfield) clearBit(peer->bitfield, chunkIndex);
+        pthread_mutex_unlock(&job->mutex);
         goto cleanup;
     }
 
-    buf = (uint8_t*)malloc(nbytes);
-    if (!buf) goto cleanup;
+    buffer = (uint8_t*)malloc(receivedBytes);
+    if (!buffer) goto cleanup;
 
-    size_t off = 0;
-    while (off < nbytes) {
-        ssize_t r = read(fd, buf + off, nbytes - off);
+    size_t offset = 0;
+    while (offset < receivedBytes) {
+        ssize_t r = read(fd, buffer + offset, receivedBytes - offset);
         if (r <= 0) goto cleanup;
-        off += (size_t)r;
+        offset += (size_t)r;
     }
 
-    pthread_mutex_lock(&j->mu);
+    pthread_mutex_lock(&job->mutex);
 
-    if (t_bitmap_get(j->have, chunk_idx)) {
-        pthread_mutex_unlock(&j->mu);
-        rc = 0;
+    if (tBitmapGet(job->haveBitfield, chunkIndex)) {
+        pthread_mutex_unlock(&job->mutex);
+        result = 0;
         goto cleanup;
     }
 
-    long pos = (long)(chunk_idx * j->chunk_size);
-    fseek(out, pos, SEEK_SET);
-    fwrite(buf, 1, nbytes, out);
-    t_bitmap_set(j->have, chunk_idx);
+    long fileOffset = (long)(chunkIndex * job->chunkSizeBytes);
+    fseek(outFile, fileOffset, SEEK_SET);
+    fwrite(buffer, 1, receivedBytes, outFile);
 
-    s->chunks_sent += 1;
-    s->bytes_sent += nbytes;
+    tBitmapSet(job->haveBitfield, chunkIndex);
 
-    pthread_mutex_unlock(&j->mu);
+    peer->chunksSent += 1;
+    peer->bytesSent += receivedBytes;
 
-    t_log("peer", "fetch: chunk=%zu done nbytes=%zu", chunk_idx, nbytes);
-    rc = 0;
+    pthread_mutex_unlock(&job->mutex);
+
+    tLog("peer", "fetch: chunk=%zu done nbytes=%zu", chunkIndex, receivedBytes);
+    result = 0;
 
 cleanup:
-    // ALWAYS release the inflight claim for this chunk
-    pthread_mutex_lock(&j->mu);
-    if (j->inflight) j->inflight[chunk_idx/8] &= (uint8_t)~(1u << (chunk_idx % 8));
-    pthread_mutex_unlock(&j->mu);
+    pthread_mutex_lock(&job->mutex);
+    if (job->inFlightBitfield) clearBit(job->inFlightBitfield, chunkIndex);
+    pthread_mutex_unlock(&job->mutex);
 
-    if (buf) free(buf);
+    if (buffer) free(buffer);
     if (fd >= 0) close(fd);
-    return rc;
+    return result;
 }
 
-static const seed *pick_seed_for(job *j, size_t chunk_idx, unsigned w) {
-    // NEW: small randomization to avoid always picking the first eligible seed
-    int start = 0;
-    if (j->npeers > 0) start = (int)((w + (unsigned)rand()) % (unsigned)j->npeers);
+static const SeedPeer *pickSeedForChunk(DownloadJob *job, size_t chunkIndex, unsigned workerId) {
+    int startIndex = 0;
+    if (job->peerCount > 0) startIndex = (int)((workerId + (unsigned)rand()) % (unsigned)job->peerCount);
 
-    for (int k=0; k<j->npeers; k++) {
-        const seed *s = &j->peers[(start + k) % j->npeers];
-        if (s->bm && t_bitmap_get(s->bm, chunk_idx)) return s;
+    for (int i = 0; i < job->peerCount; i++) {
+        const SeedPeer *peer = &job->peers[(startIndex + i) % job->peerCount];
+        if (peer->bitfield && tBitmapGet(peer->bitfield, chunkIndex)) return peer;
     }
     return NULL;
 }
 
-typedef struct { job *j; FILE *out; unsigned wid; } worker_arg;
+typedef struct { DownloadJob *job; FILE *outFile; unsigned workerId; } WorkerArgs;
 
 static void *worker(void *arg) {
-    worker_arg *wa = (worker_arg*)arg;
-    job *j = wa->j;
+    WorkerArgs *args = (WorkerArgs*)arg;
+    DownloadJob *job = args->job;
 
     for (;;) {
-        size_t todo = (size_t)-1;
+        size_t chosenChunk = (size_t)-1;
 
-        pthread_mutex_lock(&j->mu);
-        for (size_t i=0; i<j->nchunks; i++) {
-            if (t_bitmap_get(j->have, i)) continue;
-            if (j->inflight && t_bitmap_get(j->inflight, i)) continue;
+        pthread_mutex_lock(&job->mutex);
+        for (size_t i = 0; i < job->chunkCount; i++) {
+            if (tBitmapGet(job->haveBitfield, i)) continue;
+            if (job->inFlightBitfield && tBitmapGet(job->inFlightBitfield, i)) continue;
 
-            // fail-fast: if no peer advertises this chunk, don't spin forever
-            int any = 0;
-            for (int p=0; p<j->npeers; p++) {
-                if (j->peers[p].bm && t_bitmap_get(j->peers[p].bm, i)) { any = 1; break; }
+            int anyPeerHasChunk = 0;
+            for (int p = 0; p < job->peerCount; p++) {
+                if (job->peers[p].bitfield && tBitmapGet(job->peers[p].bitfield, i)) { anyPeerHasChunk = 1; break; }
             }
-            if (!any) { todo = i; break; } // picked as "impossible" marker
-            if (j->inflight) t_bitmap_set(j->inflight, i);
-            todo = i;
+
+            if (!anyPeerHasChunk) { chosenChunk = i; break; }
+            if (job->inFlightBitfield) tBitmapSet(job->inFlightBitfield, i);
+
+            chosenChunk = i;
             break;
         }
-        pthread_mutex_unlock(&j->mu);
+        pthread_mutex_unlock(&job->mutex);
 
-        if (todo == (size_t)-1) break;
+        if (chosenChunk == (size_t)-1) break;
 
-        // If we found an "impossible" chunk (no peer has it), stop the whole download.
-        pthread_mutex_lock(&j->mu);
-        int any = 0;
-        for (int p=0; p<j->npeers; p++) {
-            if (j->peers[p].bm && t_bitmap_get(j->peers[p].bm, todo)) { any = 1; break; }
+        pthread_mutex_lock(&job->mutex);
+        int anyPeerHasChunk = 0;
+        for (int p = 0; p < job->peerCount; p++) {
+            if (job->peers[p].bitfield && tBitmapGet(job->peers[p].bitfield, chosenChunk)) { anyPeerHasChunk = 1; break; }
         }
-        pthread_mutex_unlock(&j->mu);
-        if (!any) {
-            t_log("peer", "GET failed: missing chunk %zu (no peer has it)", todo);
+        pthread_mutex_unlock(&job->mutex);
+
+        if (!anyPeerHasChunk) {
+            tLog("peer", "GET failed: missing chunk %zu (no peer has it)", chosenChunk);
             return NULL;
         }
 
-        const seed *cs = pick_seed_for(j, todo, wa->wid);
-        if (!cs) { usleep(50*1000); continue; }
+        const SeedPeer *chosenPeer = pickSeedForChunk(job, chosenChunk, args->workerId);
+        if (!chosenPeer) { usleep(50 * 1000); continue; }
 
-        (void)fetch_chunk(j, todo, (seed*)cs, wa->out);
+        (void)fetchChunk(job, chosenChunk, (SeedPeer*)chosenPeer, args->outFile);
     }
     return NULL;
 }
 
-static int cmd_get(const char *tracker_host, const char *tracker_port, const char *file, const char *outpath) {
-    t_log("peer", "GET start file=%s out=%s tracker=%s:%s", file, outpath, tracker_host, tracker_port);
+static int cmdGet(const char *trackerHost, const char *trackerPort, const char *fileName, const char *outPath) {
+    tLog("peer", "GET start file=%s out=%s tracker=%s:%s", fileName, outPath, trackerHost, trackerPort);
 
-    // NEW: seed RNG for pick_seed_for()
     srand((unsigned)time(NULL) ^ (unsigned)getpid());
 
-    job j;
-    memset(&j, 0, sizeof j);
-    strncpy(j.file, file, sizeof(j.file)-1);
-    strncpy(j.outpath, outpath, sizeof(j.outpath)-1);
+    DownloadJob job;
+    memset(&job, 0, sizeof job);
+    strncpy(job.fileName, fileName, sizeof(job.fileName) - 1);
+    strncpy(job.outputPath, outPath, sizeof(job.outputPath) - 1);
 
-    if (query(&j, tracker_host, tracker_port) != 0) { t_log("peer", "GET: query failed"); return -1; }
+    if (queryTracker(&job, trackerHost, trackerPort) != 0) { tLog("peer", "GET: query failed"); return -1; }
 
-    // NEW: resume support
     struct stat st;
-    int exists = (stat(outpath, &st) == 0);
+    int fileExists = (stat(outPath, &st) == 0);
 
-    FILE *out = fopen(outpath, exists ? "rb+" : "wb+");
-    if (!out) return -1;
+    FILE *outFile = fopen(outPath, fileExists ? "rb+" : "wb+");
+    if (!outFile) return -1;
 
-    // Ensure file is at least j.size for random-access writes (best-effort)
-    if (ftruncate(fileno(out), (off_t)j.size) != 0) { /* best-effort */ }
+    if (ftruncate(fileno(outFile), (off_t)job.totalSizeBytes) != 0) { /* best-effort */ }
 
-    // If we already had bytes on disk, mark corresponding chunks as present (full chunks only)
-    if (exists) {
-        size_t have_size = (size_t)st.st_size;
-        if (have_size > j.size) have_size = j.size;
+    if (fileExists) {
+        size_t haveSizeBytes = (size_t)st.st_size;
+        if (haveSizeBytes > job.totalSizeBytes) haveSizeBytes = job.totalSizeBytes;
 
-        size_t have_chunks = 0;
-        if (j.chunk_size) {
-            have_chunks = have_size / j.chunk_size;
-            if ((have_size % j.chunk_size) != 0) have_chunks += 1; // if you want to treat partial last chunk as present
+        size_t haveChunks = 0;
+        if (job.chunkSizeBytes) {
+            haveChunks = haveSizeBytes / job.chunkSizeBytes;
+            if ((haveSizeBytes % job.chunkSizeBytes) != 0) haveChunks += 1;
         }
 
-        pthread_mutex_lock(&j.mu);
-        for (size_t i = 0; i < have_chunks && i < j.nchunks; i++) t_bitmap_set(j.have, i);
-        pthread_mutex_unlock(&j.mu);
+        pthread_mutex_lock(&job.mutex);
+        for (size_t i = 0; i < haveChunks && i < job.chunkCount; i++) tBitmapSet(job.haveBitfield, i);
+        pthread_mutex_unlock(&job.mutex);
 
-        t_log("peer", "GET resume: already_have_bytes=%zu already_have_chunks=%zu", have_size, have_chunks);
+        tLog("peer", "GET resume: already_have_bytes=%zu already_have_chunks=%zu", haveSizeBytes, haveChunks);
     }
 
-    pthread_t th[WORKERS];
-    worker_arg wa[WORKERS];
-    for (unsigned i=0; i<WORKERS; i++) {
-        wa[i].j = &j; wa[i].out = out; wa[i].wid = i;
-        pthread_create(&th[i], NULL, worker, &wa[i]);
+    pthread_t threads[WORKERS];
+    WorkerArgs workerArgs[WORKERS];
+    for (unsigned i = 0; i < WORKERS; i++) {
+        workerArgs[i].job = &job;
+        workerArgs[i].outFile = outFile;
+        workerArgs[i].workerId = i;
+        pthread_create(&threads[i], NULL, worker, &workerArgs[i]);
     }
-    for (unsigned i=0; i<WORKERS; i++) pthread_join(th[i], NULL);
+    for (unsigned i = 0; i < WORKERS; i++) pthread_join(threads[i], NULL);
 
-    // NEW: verify completion (all chunks present)
-    int ok = 1;
-    pthread_mutex_lock(&j.mu);
-    for (size_t i=0; i<j.nchunks; i++) {
-        if (!t_bitmap_get(j.have, i)) { ok = 0; break; }
+    int complete = 1;
+    pthread_mutex_lock(&job.mutex);
+    for (size_t i = 0; i < job.chunkCount; i++) {
+        if (!tBitmapGet(job.haveBitfield, i)) { complete = 0; break; }
     }
-    pthread_mutex_unlock(&j.mu);
+    pthread_mutex_unlock(&job.mutex);
 
-    // NEW: print a distribution summary to prove multi-peer download
-    pthread_mutex_lock(&j.mu);
-    t_log("peer", "DOWNLOAD SOURCES SUMMARY (chunks/bytes by peer):");
-    for (int i=0; i<j.npeers; i++) {
-        seed *s = &j.peers[i];
-        if (s->chunks_sent == 0 && s->bytes_sent == 0) continue;
-        t_log("peer", "  %s:%d -> chunks=%zu bytes=%zu", s->ip, s->port, s->chunks_sent, s->bytes_sent);
+    pthread_mutex_lock(&job.mutex);
+    tLog("peer", "DOWNLOAD SOURCES SUMMARY (chunks/bytes by peer):");
+    for (int i = 0; i < job.peerCount; i++) {
+        SeedPeer *peer = &job.peers[i];
+        if (peer->chunksSent == 0 && peer->bytesSent == 0) continue;
+        tLog("peer", "  %s:%d -> chunks=%zu bytes=%zu", peer->ip, peer->port, peer->chunksSent, peer->bytesSent);
     }
-    pthread_mutex_unlock(&j.mu);
+    pthread_mutex_unlock(&job.mutex);
 
-    if (!ok) {
-        t_log("peer", "GET incomplete file=%s out=%s", file, outpath);
-        fclose(out);
+    if (!complete) {
+        tLog("peer", "GET incomplete file=%s out=%s", fileName, outPath);
+        fclose(outFile);
         return -1;
     }
 
-    t_log("peer", "GET complete file=%s out=%s", file, outpath);
-
-    fclose(out);
+    tLog("peer", "GET complete file=%s out=%s", fileName, outPath);
+    fclose(outFile);
     return 0;
 }
 
-static int cmd_seed(const char *tracker_host, const char *tracker_port, int listen_port,
-                    const char *data_dir, const char *file, size_t full_size) {
-    const size_t chunk_size = (size_t)T_CHUNK_SIZE;
+static int cmdSeed(const char *trackerHost, const char *trackerPort, int listenPort,
+                   const char *dataDir, const char *fileName, size_t fullSizeBytes) {
+    const size_t chunkSizeBytes = (size_t)T_CHUNK_SIZE;
     char path[768];
-    snprintf(path, sizeof path, "%s/%s", data_dir, file);
-    return announce(tracker_host, tracker_port, listen_port, file, path, chunk_size, full_size);
+    snprintf(path, sizeof path, "%s/%s", dataDir, fileName);
+    return announceToTracker(trackerHost, trackerPort, listenPort, fileName, path, chunkSizeBytes, fullSizeBytes);
 }
 
 int main(int argc, char **argv) {
@@ -481,12 +499,12 @@ int main(int argc, char **argv) {
         size_t full_size = 0;
         if (argc >= 4) full_size = (size_t)strtoull(argv[3], NULL, 10);
         int lp = atoi(listen_port);
-        return cmd_seed(tracker_host, tracker_port, lp, data_dir, argv[2], full_size) == 0 ? 0 : 1;
+        return cmdSeed(tracker_host, tracker_port, lp, data_dir, argv[2], full_size) == 0 ? 0 : 1;
     }
 
     if (argc >= 2 && strcmp(argv[1], "get") == 0) {
         if (argc < 4) { fprintf(stderr, "usage: tpeer get <file> <outpath>\n"); return 2; }
-        return cmd_get(tracker_host, tracker_port, argv[2], argv[3]) == 0 ? 0 : 1;
+        return cmdGet(tracker_host, tracker_port, argv[2], argv[3]) == 0 ? 0 : 1;
     }
 
     // default: run server + periodic announce of all files in /data (simple: announce one optional SEED_FILE)
@@ -498,7 +516,7 @@ int main(int argc, char **argv) {
     if (seed_file && seed_file[0]) {
         int lp = atoi(listen_port);
         for (;;) {
-            cmd_seed(tracker_host, tracker_port, lp, data_dir, seed_file, 0);
+            cmdSeed(tracker_host, tracker_port, lp, data_dir, seed_file, 0);
             sleep(2);
         }
     }
