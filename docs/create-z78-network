@@ -1,0 +1,8 @@
+docker network create \
+  --driver bridge \
+  --subnet 172.21.78.0/24 \
+  --gateway 172.21.78.1 \
+  --ipv6 \
+  --subnet fd00:1032:ac21:78::/64 \
+  --gateway fd00:1032:ac21:78::1 \
+  z78_network
