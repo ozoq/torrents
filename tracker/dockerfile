@@ -6,5 +6,10 @@ COPY ./tracker /app/torrents/tracker
 # was: COPY ../common /app/torrents/common
 COPY ./common /app/torrents/common
 
-RUN gcc -std=gnu11 -O2 -Wall -Wextra -o /app/tracker /app/torrents/tracker/main.c /app/torrents/common/proto.c
+RUN gcc -std=gnu11 -O2 -Wall -Wextra -o /app/tracker \
+	/app/torrents/tracker/main.c \
+	/app/torrents/common/proto_net.c \
+	/app/torrents/common/proto_codec.c \
+	/app/torrents/common/proto_bitfield.c \
+	/app/torrents/common/proto_msg.c
 CMD ["/app/tracker", "9000"]

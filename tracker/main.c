@@ -64,29 +64,39 @@ static PeerInfo *getPeerForFile(FileEntry *fileEntry, const char *ip, int port) 
 
 // handleClient - read one line then handle ANNOUNCE or QUERY and send reply
 static void handleClient(int clientFd, const char *remoteIp) {
-    char line[T_MAX_LINE];
-    int bytesRead = tReadLine(clientFd, line, sizeof line);
+    char line[PROTO_MAX_LINE];
+    int bytesRead = protoReadLine(clientFd, line, sizeof line);
     if (bytesRead <= 0) return;
 
-    // step 1 read command and parse it
-    if (strncmp(line, "ANNOUNCE ", 9) == 0) {
-        int peerPort = 0;
-        char fileName[MAX_NAME];
-        unsigned long long fullSizeBytes = 0;
-        unsigned long long haveSizeBytes = 0;
-        unsigned long long chunkSizeBytes = 0;
-        char hexBitfield[T_MAX_LINE];
+    char rawLine[PROTO_MAX_LINE];
+    strncpy(rawLine, line, sizeof rawLine - 1);
+    rawLine[sizeof rawLine - 1] = 0;
 
-        if (sscanf(line, "ANNOUNCE %d %255s %llu %llu %llu %4095s",
-                   &peerPort, fileName, &fullSizeBytes, &haveSizeBytes, &chunkSizeBytes, hexBitfield) != 6) {
-            tLog("tracker", "ANNOUNCE from %s: bad announce line", remoteIp);
-            tWriteAll(clientFd, "ERR bad_announce\n", 17);
-            return;
+    ProtoMsg msg;
+    if (protoParseLine(line, &msg) != 0) {
+        protoLog("tracker", "bad request from %s: %s", remoteIp, rawLine);
+        if (strncmp(rawLine, "ANNOUNCE ", 9) == 0) {
+            protoWriteAll(clientFd, "ERR bad_announce\n", 17);
+        } else if (strncmp(rawLine, "QUERY ", 6) == 0) {
+            protoWriteAll(clientFd, "ERR bad_query\n", 14);
+        } else {
+            protoWriteAll(clientFd, "ERR bad_request\n", 16);
         }
+        return;
+    }
+
+    // step 1 read command and parse it
+    if (msg.type == PROTO_MSG_ANNOUNCE) {
+        int peerPort = msg.as.announce.peerPort;
+        const char *fileName = msg.as.announce.fileName;
+        size_t fullSizeBytes = msg.as.announce.fullSizeBytes;
+        size_t haveSizeBytes = msg.as.announce.haveSizeBytes;
+        size_t chunkSizeBytes = msg.as.announce.chunkSizeBytes;
+        const char *hexBitfield = msg.as.announce.bitfieldHex;
 
         // step 2 find file entry and check file meta match
         FileEntry *fileEntry = getFileEntry(fileName);
-        if (!fileEntry) { tWriteAll(clientFd, "ERR file_table_full\n", 20); return; }
+        if (!fileEntry) { protoWriteAll(clientFd, "ERR file_table_full\n", 20); return; }
 
         if (fileEntry->totalSizeBytes == 0) {
             fileEntry->totalSizeBytes = (size_t)fullSizeBytes;
@@ -96,47 +106,41 @@ static void handleClient(int clientFd, const char *remoteIp) {
             if (fileEntry->chunkSizeBytes) {
                 fileEntry->chunkCount = (fileEntry->totalSizeBytes + fileEntry->chunkSizeBytes - 1) / fileEntry->chunkSizeBytes;
             }
-            fileEntry->bitfieldBytes = tBitmapByteCount(fileEntry->chunkCount);
+            fileEntry->bitfieldBytes = protoBitmapByteCount(fileEntry->chunkCount);
         } else {
             if (fileEntry->totalSizeBytes != (size_t)fullSizeBytes || fileEntry->chunkSizeBytes != (size_t)chunkSizeBytes) {
-                tLog("tracker", "ANNOUNCE from %s:%d file=%s: meta mismatch", remoteIp, peerPort, fileName);
-                tWriteAll(clientFd, "ERR meta_mismatch\n", 18);
+                protoLog("tracker", "ANNOUNCE from %s:%d file=%s: meta mismatch", remoteIp, peerPort, fileName);
+                protoWriteAll(clientFd, "ERR meta_mismatch\n", 18);
                 return;
             }
         }
 
         // step 3 find peer record and store peer bitmap
         PeerInfo *peer = getPeerForFile(fileEntry, remoteIp, peerPort);
-        if (!peer) { tWriteAll(clientFd, "ERR peer_table_full\n", 20); return; }
+        if (!peer) { protoWriteAll(clientFd, "ERR peer_table_full\n", 20); return; }
 
         if (peer->bitfield) free(peer->bitfield);
         peer->bitfieldBytes = fileEntry->bitfieldBytes;
         peer->bitfield = (uint8_t*)calloc(peer->bitfieldBytes ? peer->bitfieldBytes : 1, 1);
-        if (!peer->bitfield) { tWriteAll(clientFd, "ERR oom\n", 8); return; }
+        if (!peer->bitfield) { protoWriteAll(clientFd, "ERR oom\n", 8); return; }
 
-        if (tHexDecode(hexBitfield, peer->bitfield, peer->bitfieldBytes) != 0) {
-            tLog("tracker", "ANNOUNCE from %s:%d file=%s: bad bitmap", remoteIp, peerPort, fileName);
-            tWriteAll(clientFd, "ERR bad_bitmap\n", 15);
+        if (protoHexDecode(hexBitfield, peer->bitfield, peer->bitfieldBytes) != 0) {
+            protoLog("tracker", "ANNOUNCE from %s:%d file=%s: bad bitmap", remoteIp, peerPort, fileName);
+            protoWriteAll(clientFd, "ERR bad_bitmap\n", 15);
             return;
         }
 
         // step 4 reply OK
-        tLog("tracker", "ANNOUNCE from %s:%d file=%s full=%zu have=%zu chunk=%zu peers_now=%d",
-              remoteIp, peerPort, fileEntry->name, fileEntry->totalSizeBytes, (size_t)haveSizeBytes,
+        protoLog("tracker", "ANNOUNCE from %s:%d file=%s full=%zu have=%zu chunk=%zu peers_now=%d",
+              remoteIp, peerPort, fileEntry->name, fileEntry->totalSizeBytes, haveSizeBytes,
               fileEntry->chunkSizeBytes, fileEntry->peerCount);
 
-        tWriteAll(clientFd, "OK\n", 3);
+        protoWriteAll(clientFd, "OK\n", 3);
         return;
     }
 
-    if (strncmp(line, "QUERY ", 6) == 0) {
-        // step 1 parse file name
-        char fileName[MAX_NAME];
-        if (sscanf(line, "QUERY %255s", fileName) != 1) {
-            tLog("tracker", "QUERY from %s: bad query line", remoteIp);
-            tWriteAll(clientFd, "ERR bad_query\n", 14);
-            return;
-        }
+    if (msg.type == PROTO_MSG_QUERY) {
+        const char *fileName = msg.as.query.fileName;
 
         // step 2 find file entry
         FileEntry *fileEntry = NULL;
@@ -144,40 +148,39 @@ static void handleClient(int clientFd, const char *remoteIp) {
             if (strcmp(g_files[i].name, fileName) == 0) { fileEntry = &g_files[i]; break; }
         }
         if (!fileEntry) {
-            tLog("tracker", "QUERY from %s file=%s: not found", remoteIp, fileName);
-            tWriteAll(clientFd, "ERR not_found\n", 14);
+            protoLog("tracker", "QUERY from %s file=%s: not found", remoteIp, fileName);
+            protoWriteAll(clientFd, "ERR not_found\n", 14);
             return;
         }
 
         // step 3 send peers header then send each peer row
-        tLog("tracker", "QUERY from %s file=%s: returning %d peers", remoteIp, fileEntry->name, fileEntry->peerCount);
+        protoLog("tracker", "QUERY from %s file=%s: returning %d peers", remoteIp, fileEntry->name, fileEntry->peerCount);
 
         char header[256];
-        int headerBytes = snprintf(header, sizeof header, "PEERS %s %zu %zu %d\n",
-                                   fileEntry->name, fileEntry->totalSizeBytes, fileEntry->chunkSizeBytes, fileEntry->peerCount);
-        tWriteAll(clientFd, header, (size_t)headerBytes);
+        int headerBytes = protoBuildPeersHeader(header, sizeof header, fileEntry->name, fileEntry->totalSizeBytes, fileEntry->chunkSizeBytes, fileEntry->peerCount);
+        if (headerBytes >= 0) protoWriteAll(clientFd, header, (size_t)headerBytes);
 
         for (int i = 0; i < fileEntry->peerCount; i++) {
             PeerInfo *peer = &fileEntry->peers[i];
             if (!peer->bitfield) continue;
 
-            char hexOut[T_MAX_LINE];
-            if (tHexEncode(peer->bitfield, peer->bitfieldBytes, hexOut, sizeof hexOut) != 0) continue;
+            char hexOut[PROTO_MAX_LINE];
+            if (protoHexEncode(peer->bitfield, peer->bitfieldBytes, hexOut, sizeof hexOut) != 0) continue;
 
-            char row[512 + T_MAX_LINE];
-            int rowBytes = snprintf(row, sizeof row, "P %s %d %s\n", peer->ip, peer->port, hexOut);
-            tWriteAll(clientFd, row, (size_t)rowBytes);
+            char row[512 + PROTO_MAX_LINE];
+            int rowBytes = protoBuildPeerRow(row, sizeof row, peer->ip, peer->port, hexOut);
+            if (rowBytes >= 0) protoWriteAll(clientFd, row, (size_t)rowBytes);
         }
         return;
     }
 
-    tWriteAll(clientFd, "ERR unknown_cmd\n", 16);
+    protoWriteAll(clientFd, "ERR unknown_cmd\n", 16);
 }
 
 // main - listen on tcp port then accept clients and handle one request per connection
 int main(int argc, char **argv) {
     const char *portString = (argc >= 2) ? argv[1] : "9000";
-    int listenFd = tListenTcp("0.0.0.0", portString, BACKLOG);
+    int listenFd = protoListenTcp("0.0.0.0", portString, BACKLOG);
     if (listenFd < 0) { perror("tracker listen"); return 1; }
     fprintf(stderr, "tracker listening on :%s\n", portString);
     fflush(stderr);
@@ -191,7 +194,7 @@ int main(int argc, char **argv) {
         char remoteIp[64];
         inet_ntop(AF_INET, &clientAddr.sin_addr, remoteIp, sizeof remoteIp);
 
-        tLog("tracker", "client %s connected", remoteIp);
+        protoLog("tracker", "client %s connected", remoteIp);
         handleClient(clientFd, remoteIp);
         close(clientFd);
     }

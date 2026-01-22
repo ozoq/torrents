@@ -77,7 +77,7 @@ static int buildBitfieldForLocalFile(const char *path, size_t totalSizeBytes, si
         }
     }
 
-    for (size_t i = 0; i < haveChunks; i++) tBitmapSet(outBitfield, i);
+    for (size_t i = 0; i < haveChunks; i++) protoBitmapSet(outBitfield, i);
     return 0;
 }
 
@@ -91,7 +91,7 @@ static int announceToTracker(const char *trackerHost, const char *trackerPort,
     if (totalSizeBytes == 0) totalSizeBytes = haveSizeBytes;
 
     size_t chunkCount = (totalSizeBytes + chunkSizeBytes - 1) / chunkSizeBytes;
-    size_t bitfieldBytes = tBitmapByteCount(chunkCount);
+    size_t bitfieldBytes = protoBitmapByteCount(chunkCount);
 
     uint8_t *bitfield = (uint8_t*)calloc(bitfieldBytes ? bitfieldBytes : 1, 1);
     if (!bitfield) return -1;
@@ -101,94 +101,93 @@ static int announceToTracker(const char *trackerHost, const char *trackerPort,
         return -1;
     }
 
-    char hexBitfield[T_MAX_LINE];
-    if (tHexEncode(bitfield, bitfieldBytes, hexBitfield, sizeof hexBitfield) != 0) {
+    char hexBitfield[PROTO_MAX_LINE];
+    char msg[PROTO_MAX_LINE];
+    if (protoHexEncode(bitfield, bitfieldBytes, hexBitfield, sizeof hexBitfield) != 0) {
         free(bitfield);
         return -1;
     }
     free(bitfield);
 
-    int fd = tConnectTcp(trackerHost, trackerPort);
-    if (fd < 0) { tPerr("peer", "connect tracker (announce)"); return -1; }
+    int fd = protoConnectTcp(trackerHost, trackerPort);
+    if (fd < 0) { protoPerr("peer", "connect tracker (announce)"); return -1; }
 
-    char msg[T_MAX_LINE];
-    int msgBytes = snprintf(msg, sizeof msg, "ANNOUNCE %d %s %zu %zu %zu %s\n",
-                            peerPort, fileName, totalSizeBytes, haveSizeBytes, chunkSizeBytes, hexBitfield);
-    if (tWriteAll(fd, msg, (size_t)msgBytes) != 0) { close(fd); return -1; }
+    int msgBytes = protoBuildAnnounce(msg, sizeof msg, peerPort, fileName, totalSizeBytes, haveSizeBytes, chunkSizeBytes, hexBitfield);
+    if (msgBytes < 0 || protoWriteAll(fd, msg, (size_t)msgBytes) != 0) { close(fd); return -1; }
 
-    char line[T_MAX_LINE];
-    if (tReadLine(fd, line, sizeof line) <= 0) { tPerr("peer", "read tracker (announce)"); close(fd); return -1; }
+    char line[PROTO_MAX_LINE];
+    if (protoReadLine(fd, line, sizeof line) <= 0) { protoPerr("peer", "read tracker (announce)"); close(fd); return -1; }
     close(fd);
 
-    if (strncmp(line, "OK\n", 3) == 0) {
-        tLog("peer", "ANNOUNCE ok file=%s full_size=%zu have_size=%zu chunk=%zu",
+    ProtoMsg resp;
+    if (protoParseLine(line, &resp) == 0 && resp.type == PROTO_MSG_OK) {
+        protoLog("peer", "ANNOUNCE ok file=%s full_size=%zu have_size=%zu chunk=%zu",
               fileName, totalSizeBytes, haveSizeBytes, chunkSizeBytes);
         return 0;
     }
 
-    tLog("peer", "ANNOUNCE failed: %s", line);
+    protoLog("peer", "ANNOUNCE failed: %s", line);
     return -1;
 }
 
 // queryTracker - send QUERY to tracker then read peers list and save it into job
 static int queryTracker(DownloadJob *job, const char *trackerHost, const char *trackerPort) {
     // step 1 connect and send QUERY
-    int fd = tConnectTcp(trackerHost, trackerPort);
-    if (fd < 0) { tPerr("peer", "connect tracker (query)"); return -1; }
+    int fd = protoConnectTcp(trackerHost, trackerPort);
+    if (fd < 0) { protoPerr("peer", "connect tracker (query)"); return -1; }
 
-    char queryLine[T_MAX_LINE];
-    int queryBytes = snprintf(queryLine, sizeof queryLine, "QUERY %s\n", job->fileName);
-    if (tWriteAll(fd, queryLine, (size_t)queryBytes) != 0) { close(fd); return -1; }
+    char queryLine[PROTO_MAX_LINE];
+    int queryBytes = protoBuildQuery(queryLine, sizeof queryLine, job->fileName);
+    if (queryBytes < 0 || protoWriteAll(fd, queryLine, (size_t)queryBytes) != 0) { close(fd); return -1; }
 
-    char line[T_MAX_LINE];
-    if (tReadLine(fd, line, sizeof line) <= 0) { tPerr("peer", "read tracker (query hdr)"); close(fd); return -1; }
-    if (strncmp(line, "PEERS ", 6) != 0) { tLog("peer", "QUERY unexpected: %s", line); close(fd); return -1; }
-
-    // step 2 read header and allocate job bitfields
-    int advertisedPeerCount = 0;
-    if (sscanf(line, "PEERS %*s %zu %zu %d", &job->totalSizeBytes, &job->chunkSizeBytes, &advertisedPeerCount) != 3) {
+    char line[PROTO_MAX_LINE];
+    if (protoReadLine(fd, line, sizeof line) <= 0) { protoPerr("peer", "read tracker (query hdr)"); close(fd); return -1; }
+    ProtoMsg hdr;
+    if (protoParseLine(line, &hdr) != 0 || hdr.type != PROTO_MSG_PEERS) {
+        protoLog("peer", "QUERY unexpected: %s", line);
         close(fd);
         return -1;
     }
 
+    // step 2 read header and allocate job bitfields
+    int advertisedPeerCount = hdr.as.peers.peerCount;
+    job->totalSizeBytes = hdr.as.peers.totalSizeBytes;
+    job->chunkSizeBytes = hdr.as.peers.chunkSizeBytes;
+
     job->chunkCount = (job->totalSizeBytes + job->chunkSizeBytes - 1) / job->chunkSizeBytes;
-    job->haveBitfield = tBitmapAlloc(job->chunkCount);
-    job->inFlightBitfield = tBitmapAlloc(job->chunkCount);
+    job->haveBitfield = protoBitmapAlloc(job->chunkCount);
+    job->inFlightBitfield = protoBitmapAlloc(job->chunkCount);
     pthread_mutex_init(&job->mutex, NULL);
 
-    size_t bitfieldBytes = tBitmapByteCount(job->chunkCount);
+    size_t bitfieldBytes = protoBitmapByteCount(job->chunkCount);
 
     // step 3 read each peer row and decode bitmap
     job->peerCount = 0;
     for (int i = 0; i < advertisedPeerCount && i < MAX_PEERS; i++) {
-        if (tReadLine(fd, line, sizeof line) <= 0) break;
-        if (strncmp(line, "P ", 2) != 0) continue;
-
-        char ip[64];
-        char hexBitfield[T_MAX_LINE];
-        int port = 0;
-        if (sscanf(line, "P %63s %d %4095s", ip, &port, hexBitfield) != 3) continue;
+        if (protoReadLine(fd, line, sizeof line) <= 0) break;
+        ProtoMsg row;
+        if (protoParseLine(line, &row) != 0 || row.type != PROTO_MSG_PEER) continue;
 
         SeedPeer *peer = &job->peers[job->peerCount++];
         memset(peer, 0, sizeof *peer);
-        strncpy(peer->ip, ip, sizeof(peer->ip) - 1);
-        peer->port = port;
+        strncpy(peer->ip, row.as.peer.ip, sizeof(peer->ip) - 1);
+        peer->port = row.as.peer.port;
 
         peer->bitfieldBytes = bitfieldBytes;
         peer->bitfield = (uint8_t*)calloc(bitfieldBytes ? bitfieldBytes : 1, 1);
         if (!peer->bitfield) { close(fd); return -1; }
 
-        if (tHexDecode(hexBitfield, peer->bitfield, bitfieldBytes) != 0) {
-            tLog("peer", "bad peer bitmap from tracker");
+        if (protoHexDecode(row.as.peer.bitfieldHex, peer->bitfield, bitfieldBytes) != 0) {
+            protoLog("peer", "bad peer bitmap from tracker");
             close(fd);
             return -1;
         }
 
-        tLog("peer", "seed[%d]=%s:%d", job->peerCount - 1, peer->ip, peer->port);
+        protoLog("peer", "seed[%d]=%s:%d", job->peerCount - 1, peer->ip, peer->port);
     }
 
     close(fd);
-    tLog("peer", "QUERY file=%s -> size=%zu chunk=%zu nchunks=%zu npeers=%d",
+    protoLog("peer", "QUERY file=%s -> size=%zu chunk=%zu nchunks=%zu npeers=%d",
           job->fileName, job->totalSizeBytes, job->chunkSizeBytes, job->chunkCount, advertisedPeerCount);
 
     return (job->peerCount > 0) ? 0 : -1;
@@ -196,53 +195,50 @@ static int queryTracker(DownloadJob *job, const char *trackerHost, const char *t
 
 // serveOne - read GET request then read chunk from disk and reply with DATA
 static int serveOne(int clientFd, const char *dataDir) {
-    char line[T_MAX_LINE];
-    if (tReadLine(clientFd, line, sizeof line) <= 0) return -1;
+    char line[PROTO_MAX_LINE];
+    if (protoReadLine(clientFd, line, sizeof line) <= 0) return -1;
 
-    char fileName[MAX_FILE];
-    long chunkIndex = -1;
-    size_t chunkSizeBytes = 0;
-
-    if (sscanf(line, "GET %255s %ld %zu", fileName, &chunkIndex, &chunkSizeBytes) == 3) {
-        if (chunkIndex < 0 || chunkSizeBytes == 0) {
-            tWriteAll(clientFd, "ERR bad_get\n", 12);
-            return -1;
-        }
-    } else {
-        if (sscanf(line, "GET %255s %ld", fileName, &chunkIndex) != 2 || chunkIndex < 0) {
-            tLog("peer", "serve: bad request: %s", line);
-            tWriteAll(clientFd, "ERR bad_get\n", 12);
-            return -1;
-        }
-        chunkSizeBytes = (size_t)T_CHUNK_SIZE;
+    ProtoMsg req;
+    if (protoParseLine(line, &req) != 0 || req.type != PROTO_MSG_GET) {
+        protoWriteAll(clientFd, "ERR bad_get\n", 12);
+        return -1;
     }
 
-    tLog("peer", "serve: GET file=%s chunk=%ld chunk_size=%zu", fileName, chunkIndex, chunkSizeBytes);
+    const char *fileName = req.as.get.fileName;
+    size_t chunkIndex = req.as.get.chunkIndex;
+    size_t chunkSizeBytes = req.as.get.chunkSizeBytes ? req.as.get.chunkSizeBytes : (size_t)PROTO_CHUNK_SIZE;
+
+    if (chunkSizeBytes == 0) {
+        protoWriteAll(clientFd, "ERR bad_get\n", 12);
+        return -1;
+    }
+
+    protoLog("peer", "serve: GET file=%s chunk=%zu chunk_size=%zu", fileName, chunkIndex, chunkSizeBytes);
 
     char path[768];
     snprintf(path, sizeof path, "%s/%s", dataDir, fileName);
 
     FILE *f = fopen(path, "rb");
-    if (!f) { tWriteAll(clientFd, "ERR no_file\n", 12); return -1; }
+    if (!f) { protoWriteAll(clientFd, "ERR no_file\n", 12); return -1; }
 
     if (fseek(f, (long)((size_t)chunkIndex * chunkSizeBytes), SEEK_SET) != 0) {
         fclose(f);
-        tWriteAll(clientFd, "ERR seek\n", 9);
+        protoWriteAll(clientFd, "ERR seek\n", 9);
         return -1;
     }
 
     uint8_t *buf = (uint8_t*)malloc(chunkSizeBytes);
-    if (!buf) { fclose(f); tWriteAll(clientFd, "ERR oom\n", 8); return -1; }
+    if (!buf) { fclose(f); protoWriteAll(clientFd, "ERR oom\n", 8); return -1; }
 
     size_t bytesRead = fread(buf, 1, chunkSizeBytes, f);
     fclose(f);
 
-    tLog("peer", "serve: DATA nbytes=%zu file=%s chunk=%ld", bytesRead, fileName, chunkIndex);
+    protoLog("peer", "serve: DATA nbytes=%zu file=%s chunk=%zu", bytesRead, fileName, chunkIndex);
 
     char header[64];
-    int headerBytes = snprintf(header, sizeof header, "DATA %zu\n", bytesRead);
-    if (tWriteAll(clientFd, header, (size_t)headerBytes) != 0) { free(buf); return -1; }
-    if (bytesRead && tWriteAll(clientFd, buf, bytesRead) != 0) { free(buf); return -1; }
+    int headerBytes = protoBuildDataHeader(header, sizeof header, bytesRead);
+    if (headerBytes < 0 || protoWriteAll(clientFd, header, (size_t)headerBytes) != 0) { free(buf); return -1; }
+    if (bytesRead && protoWriteAll(clientFd, buf, bytesRead) != 0) { free(buf); return -1; }
 
     free(buf);
     return 0;
@@ -254,7 +250,7 @@ static void *serveThread(void *arg) {
     const char *listenPort = args[0];
     const char *dataDir = args[1];
 
-    int listenFd = tListenTcp("0.0.0.0", listenPort, BACKLOG);
+    int listenFd = protoListenTcp("0.0.0.0", listenPort, BACKLOG);
     if (listenFd < 0) { perror("peer listen"); return NULL; }
 
     for (;;) {
@@ -276,21 +272,22 @@ static int fetchChunk(DownloadJob *job, size_t chunkIndex, SeedPeer *peer, FILE 
     char portString[16];
     snprintf(portString, sizeof portString, "%d", peer->port);
 
-    tLog("peer", "fetch: chunk=%zu from %s:%d", chunkIndex, peer->ip, peer->port);
+    protoLog("peer", "fetch: chunk=%zu from %s:%d", chunkIndex, peer->ip, peer->port);
 
-    fd = tConnectTcp(peer->ip, portString);
-    if (fd < 0) { tPerr("peer", "connect seed"); goto cleanup; }
+    fd = protoConnectTcp(peer->ip, portString);
+    if (fd < 0) { protoPerr("peer", "connect seed"); goto cleanup; }
 
-    char request[T_MAX_LINE];
-    int requestBytes = snprintf(request, sizeof request, "GET %s %zu %zu\n", job->fileName, chunkIndex, job->chunkSizeBytes);
-    if (tWriteAll(fd, request, (size_t)requestBytes) != 0) goto cleanup;
+    char request[PROTO_MAX_LINE];
+    int requestBytes = protoBuildGet(request, sizeof request, job->fileName, chunkIndex, job->chunkSizeBytes);
+    if (requestBytes < 0 || protoWriteAll(fd, request, (size_t)requestBytes) != 0) goto cleanup;
 
     // step 2 read DATA header and read bytes
-    char line[T_MAX_LINE];
-    if (tReadLine(fd, line, sizeof line) <= 0) goto cleanup;
+    char line[PROTO_MAX_LINE];
+    if (protoReadLine(fd, line, sizeof line) <= 0) goto cleanup;
 
-    size_t receivedBytes = 0;
-    if (sscanf(line, "DATA %zu", &receivedBytes) != 1) goto cleanup;
+    ProtoMsg dataHdr;
+    if (protoParseLine(line, &dataHdr) != 0 || dataHdr.type != PROTO_MSG_DATA) goto cleanup;
+    size_t receivedBytes = dataHdr.as.data.byteCount;
 
     size_t expectedBytes = job->chunkSizeBytes;
     if (chunkIndex + 1 == job->chunkCount) {
@@ -318,7 +315,7 @@ static int fetchChunk(DownloadJob *job, size_t chunkIndex, SeedPeer *peer, FILE 
     // step 3 write to output file and mark chunk as done
     pthread_mutex_lock(&job->mutex);
 
-    if (tBitmapGet(job->haveBitfield, chunkIndex)) {
+    if (protoBitmapGet(job->haveBitfield, chunkIndex)) {
         pthread_mutex_unlock(&job->mutex);
         result = 0;
         goto cleanup;
@@ -328,14 +325,14 @@ static int fetchChunk(DownloadJob *job, size_t chunkIndex, SeedPeer *peer, FILE 
     fseek(outFile, fileOffset, SEEK_SET);
     fwrite(buffer, 1, receivedBytes, outFile);
 
-    tBitmapSet(job->haveBitfield, chunkIndex);
+    protoBitmapSet(job->haveBitfield, chunkIndex);
 
     peer->chunksSent += 1;
     peer->bytesSent += receivedBytes;
 
     pthread_mutex_unlock(&job->mutex);
 
-    tLog("peer", "fetch: chunk=%zu done nbytes=%zu", chunkIndex, receivedBytes);
+    protoLog("peer", "fetch: chunk=%zu done nbytes=%zu", chunkIndex, receivedBytes);
     result = 0;
 
 cleanup:
@@ -356,7 +353,7 @@ static const SeedPeer *pickSeedForChunk(DownloadJob *job, size_t chunkIndex, uns
 
     for (int i = 0; i < job->peerCount; i++) {
         const SeedPeer *peer = &job->peers[(startIndex + i) % job->peerCount];
-        if (peer->bitfield && tBitmapGet(peer->bitfield, chunkIndex)) return peer;
+        if (peer->bitfield && protoBitmapGet(peer->bitfield, chunkIndex)) return peer;
     }
     return NULL;
 }
@@ -374,16 +371,16 @@ static void *worker(void *arg) {
         // step 1 pick a chunk we dont have and mark it inflight
         pthread_mutex_lock(&job->mutex);
         for (size_t i = 0; i < job->chunkCount; i++) {
-            if (tBitmapGet(job->haveBitfield, i)) continue;
-            if (job->inFlightBitfield && tBitmapGet(job->inFlightBitfield, i)) continue;
+            if (protoBitmapGet(job->haveBitfield, i)) continue;
+            if (job->inFlightBitfield && protoBitmapGet(job->inFlightBitfield, i)) continue;
 
             int anyPeerHasChunk = 0;
             for (int p = 0; p < job->peerCount; p++) {
-                if (job->peers[p].bitfield && tBitmapGet(job->peers[p].bitfield, i)) { anyPeerHasChunk = 1; break; }
+                if (job->peers[p].bitfield && protoBitmapGet(job->peers[p].bitfield, i)) { anyPeerHasChunk = 1; break; }
             }
 
             if (!anyPeerHasChunk) { chosenChunk = i; break; }
-            if (job->inFlightBitfield) tBitmapSet(job->inFlightBitfield, i);
+            if (job->inFlightBitfield) protoBitmapSet(job->inFlightBitfield, i);
 
             chosenChunk = i;
             break;
@@ -396,12 +393,12 @@ static void *worker(void *arg) {
         pthread_mutex_lock(&job->mutex);
         int anyPeerHasChunk = 0;
         for (int p = 0; p < job->peerCount; p++) {
-            if (job->peers[p].bitfield && tBitmapGet(job->peers[p].bitfield, chosenChunk)) { anyPeerHasChunk = 1; break; }
+            if (job->peers[p].bitfield && protoBitmapGet(job->peers[p].bitfield, chosenChunk)) { anyPeerHasChunk = 1; break; }
         }
         pthread_mutex_unlock(&job->mutex);
 
         if (!anyPeerHasChunk) {
-            tLog("peer", "GET failed: missing chunk %zu (no peer has it)", chosenChunk);
+            protoLog("peer", "GET failed: missing chunk %zu (no peer has it)", chosenChunk);
             return NULL;
         }
 
@@ -417,7 +414,7 @@ static void *worker(void *arg) {
 // cmdGet - query tracker then start workers and wait then check all chunks are downloaded
 static int cmdGet(const char *trackerHost, const char *trackerPort, const char *fileName, const char *outPath) {
     // step 1 query tracker
-    tLog("peer", "GET start file=%s out=%s tracker=%s:%s", fileName, outPath, trackerHost, trackerPort);
+    protoLog("peer", "GET start file=%s out=%s tracker=%s:%s", fileName, outPath, trackerHost, trackerPort);
 
     srand((unsigned)time(NULL) ^ (unsigned)getpid());
 
@@ -426,7 +423,7 @@ static int cmdGet(const char *trackerHost, const char *trackerPort, const char *
     strncpy(job.fileName, fileName, sizeof(job.fileName) - 1);
     strncpy(job.outputPath, outPath, sizeof(job.outputPath) - 1);
 
-    if (queryTracker(&job, trackerHost, trackerPort) != 0) { tLog("peer", "GET: query failed"); return -1; }
+    if (queryTracker(&job, trackerHost, trackerPort) != 0) { protoLog("peer", "GET: query failed"); return -1; }
 
     // step 2 open output file and mark already have chunks if file exists
     struct stat st;
@@ -451,10 +448,10 @@ static int cmdGet(const char *trackerHost, const char *trackerPort, const char *
         }
 
         pthread_mutex_lock(&job.mutex);
-        for (size_t i = 0; i < haveChunks && i < job.chunkCount; i++) tBitmapSet(job.haveBitfield, i);
+        for (size_t i = 0; i < haveChunks && i < job.chunkCount; i++) protoBitmapSet(job.haveBitfield, i);
         pthread_mutex_unlock(&job.mutex);
 
-        tLog("peer", "GET resume: already_have_bytes=%zu already_have_chunks=%zu", haveSizeBytes, haveChunks);
+        protoLog("peer", "GET resume: already_have_bytes=%zu already_have_chunks=%zu", haveSizeBytes, haveChunks);
     }
 
     // step 3 start worker threads and wait
@@ -472,26 +469,26 @@ static int cmdGet(const char *trackerHost, const char *trackerPort, const char *
     int complete = 1;
     pthread_mutex_lock(&job.mutex);
     for (size_t i = 0; i < job.chunkCount; i++) {
-        if (!tBitmapGet(job.haveBitfield, i)) { complete = 0; break; }
+        if (!protoBitmapGet(job.haveBitfield, i)) { complete = 0; break; }
     }
     pthread_mutex_unlock(&job.mutex);
 
     pthread_mutex_lock(&job.mutex);
-    tLog("peer", "DOWNLOAD SOURCES SUMMARY (chunks/bytes by peer):");
+    protoLog("peer", "DOWNLOAD SOURCES SUMMARY (chunks/bytes by peer):");
     for (int i = 0; i < job.peerCount; i++) {
         SeedPeer *peer = &job.peers[i];
         if (peer->chunksSent == 0 && peer->bytesSent == 0) continue;
-        tLog("peer", "  %s:%d -> chunks=%zu bytes=%zu", peer->ip, peer->port, peer->chunksSent, peer->bytesSent);
+        protoLog("peer", "  %s:%d -> chunks=%zu bytes=%zu", peer->ip, peer->port, peer->chunksSent, peer->bytesSent);
     }
     pthread_mutex_unlock(&job.mutex);
 
     if (!complete) {
-        tLog("peer", "GET incomplete file=%s out=%s", fileName, outPath);
+        protoLog("peer", "GET incomplete file=%s out=%s", fileName, outPath);
         fclose(outFile);
         return -1;
     }
 
-    tLog("peer", "GET complete file=%s out=%s", fileName, outPath);
+    protoLog("peer", "GET complete file=%s out=%s", fileName, outPath);
     fclose(outFile);
     return 0;
 }
@@ -499,7 +496,7 @@ static int cmdGet(const char *trackerHost, const char *trackerPort, const char *
 // cmdSeed - make file path then call announceToTracker
 static int cmdSeed(const char *trackerHost, const char *trackerPort, int listenPort,
                    const char *dataDir, const char *fileName, size_t fullSizeBytes) {
-    const size_t chunkSizeBytes = (size_t)T_CHUNK_SIZE;
+    const size_t chunkSizeBytes = (size_t)PROTO_CHUNK_SIZE;
     char path[768];
     snprintf(path, sizeof path, "%s/%s", dataDir, fileName);
     return announceToTracker(trackerHost, trackerPort, listenPort, fileName, path, chunkSizeBytes, fullSizeBytes);
