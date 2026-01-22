@@ -30,7 +30,8 @@ prepareData() {
 
   for peer in peer1 peer2 peer3; do
     if [ -d "$DATA_DIR/$peer" ]; then
-      find "$DATA_DIR/$peer" -mindepth 1 -maxdepth 1 -name "*${TEST_SUFFIX}" -exec rm -rf -- {} +
+      # Remove test artifacts, including resume sidecars (e.g. `out.bin.test.tmp.resume`).
+      find "$DATA_DIR/$peer" -mindepth 1 -maxdepth 1 -name "*${TEST_SUFFIX}*" -exec rm -rf -- {} +
     fi
   done
 

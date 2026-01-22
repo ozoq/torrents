@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <time.h>
+#include <signal.h>
 
 #define BACKLOG 16
 #define MAX_PEERS 64
@@ -42,7 +43,17 @@ typedef struct {
     uint8_t *inFlightBitfield;
 
     pthread_mutex_t mutex;
+
+    char resumePath[768];
+    time_t lastResumeSave;
 } DownloadJob;
+
+static volatile sig_atomic_t g_stopRequested = 0;
+
+static void handleStopSignal(int sig) {
+    (void)sig;
+    g_stopRequested = 1;
+}
 
 // clearBit - clear one bit in bitfield by masking that bit out
 static void clearBit(uint8_t *bitfield, size_t bitIndex) {
@@ -57,27 +68,124 @@ static int getFileSizeBytes(const char *path, size_t *outSizeBytes) {
     return 0;
 }
 
-// buildBitfieldForLocalFile - look at file size and mark chunks we already have
-static int buildBitfieldForLocalFile(const char *path, size_t totalSizeBytes, size_t chunkSizeBytes,
-                                     uint8_t *outBitfield, size_t outBitfieldBytes) {
-    (void)outBitfieldBytes;
+static int buildResumePath(char *out, size_t outSize, const char *path) {
+    int n = snprintf(out, outSize, "%s.resume", path);
+    return (n < 0 || (size_t)n >= outSize) ? -1 : 0;
+}
 
-    struct stat st;
-    if (stat(path, &st) != 0) return -1;
+static int loadOrInitHaveBitfieldForPath(const char *path,
+                                        size_t totalSizeBytes,
+                                        size_t chunkSizeBytes,
+                                        uint8_t *outBitfield,
+                                        size_t outBitfieldBytes) {
+    if (!path || !outBitfield) return -1;
 
-    size_t haveSizeBytes = (size_t)st.st_size;
+    char resumePath[768];
+    if (buildResumePath(resumePath, sizeof resumePath, path) != 0) return -1;
+
+    size_t rTotal = 0, rChunk = 0, rCount = 0, rBytes = 0;
+    uint8_t *rBits = NULL;
+    if (protoResumeLoad(resumePath, &rTotal, &rChunk, &rCount, &rBits, &rBytes) == 0) {
+        size_t expectedCount = (totalSizeBytes + chunkSizeBytes - 1) / chunkSizeBytes;
+        if (rTotal == totalSizeBytes && rChunk == chunkSizeBytes && rCount == expectedCount && rBytes == outBitfieldBytes) {
+            memcpy(outBitfield, rBits, outBitfieldBytes);
+            free(rBits);
+            return 0;
+        }
+        free(rBits);
+    }
+
+    // Fallback (prefix-based): infer from file size. This supports existing tests and
+    // non-gap resume. For true sparse/gap support, create/update the .resume bitmap.
+    size_t haveSizeBytes = 0;
+    if (getFileSizeBytes(path, &haveSizeBytes) != 0) return -1;
     if (haveSizeBytes > totalSizeBytes) haveSizeBytes = totalSizeBytes;
 
+    size_t chunkCount = (totalSizeBytes + chunkSizeBytes - 1) / chunkSizeBytes;
     size_t haveChunks = 0;
     if (chunkSizeBytes) {
         if (haveSizeBytes == totalSizeBytes) {
-            haveChunks = (totalSizeBytes + chunkSizeBytes - 1) / chunkSizeBytes;
+            haveChunks = chunkCount;
         } else {
             haveChunks = haveSizeBytes / chunkSizeBytes; // floor: excludes partial chunk
         }
     }
 
+    memset(outBitfield, 0, outBitfieldBytes);
     for (size_t i = 0; i < haveChunks; i++) protoBitmapSet(outBitfield, i);
+
+    (void)protoResumeSave(resumePath, totalSizeBytes, chunkSizeBytes, chunkCount, outBitfield, outBitfieldBytes);
+    return 0;
+}
+
+// buildBitfieldForLocalFile - look at file size and mark chunks we already have
+static int buildBitfieldForLocalFile(const char *path, size_t totalSizeBytes, size_t chunkSizeBytes,
+                                     uint8_t *outBitfield, size_t outBitfieldBytes) {
+    return loadOrInitHaveBitfieldForPath(path, totalSizeBytes, chunkSizeBytes, outBitfield, outBitfieldBytes);
+}
+
+static int computeChunkHashHex(const char *path,
+                               size_t totalSizeBytes,
+                               size_t chunkSizeBytes,
+                               size_t chunkIndex,
+                               char outHex65[65]) {
+    if (!path || !outHex65 || chunkSizeBytes == 0) return -1;
+
+    size_t chunkCount = (totalSizeBytes + chunkSizeBytes - 1) / chunkSizeBytes;
+    if (chunkIndex >= chunkCount) return -1;
+
+    size_t expectedBytes = chunkSizeBytes;
+    if (chunkIndex + 1 == chunkCount) {
+        size_t remaining = totalSizeBytes - (chunkIndex * chunkSizeBytes);
+        if (remaining < expectedBytes) expectedBytes = remaining;
+    }
+
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    if (fseek(f, (long)(chunkIndex * chunkSizeBytes), SEEK_SET) != 0) { fclose(f); return -1; }
+
+    uint8_t *buf = (uint8_t*)malloc(expectedBytes ? expectedBytes : 1);
+    if (!buf) { fclose(f); return -1; }
+
+    size_t got = fread(buf, 1, expectedBytes, f);
+    fclose(f);
+
+    int rc = -1;
+    if (got == expectedBytes) {
+        rc = protoSha256Hex(buf, got, outHex65);
+    }
+    free(buf);
+    return rc;
+}
+
+static int requestRemoteChunkHash(const char *ip,
+                                  int port,
+                                  const char *fileName,
+                                  size_t chunkIndex,
+                                  size_t chunkSizeBytes,
+                                  char outHex65[65]) {
+    if (!ip || !fileName || !outHex65) return -1;
+
+    char portString[16];
+    snprintf(portString, sizeof portString, "%d", port);
+
+    int fd = protoConnectTcp(ip, portString);
+    if (fd < 0) return -1;
+
+    char reqLine[PROTO_MAX_LINE];
+    int reqBytes = protoBuildHashReq(reqLine, sizeof reqLine, fileName, chunkIndex, chunkSizeBytes);
+    if (reqBytes < 0 || protoWriteAll(fd, reqLine, (size_t)reqBytes) != 0) { close(fd); return -1; }
+
+    char line[PROTO_MAX_LINE];
+    if (protoReadLine(fd, line, sizeof line) <= 0) { close(fd); return -1; }
+    close(fd);
+
+    ProtoMsg resp;
+    if (protoParseLine(line, &resp) != 0 || resp.type != PROTO_MSG_HASH) return -1;
+    if (resp.as.hash.chunkIndex != chunkIndex) return -1;
+
+    strncpy(outHex65, resp.as.hash.sha256Hex ? resp.as.hash.sha256Hex : "", 64);
+    outHex65[64] = 0;
     return 0;
 }
 
@@ -128,6 +236,125 @@ static int announceToTracker(const char *trackerHost, const char *trackerPort,
 
     protoLog("peer", "ANNOUNCE failed: %s", line);
     return -1;
+}
+
+static int queryTrackerMetaAndPeers(const char *trackerHost, const char *trackerPort, const char *fileName,
+                                    size_t *outTotalSizeBytes, size_t *outChunkSizeBytes,
+                                    SeedPeer *outPeers, int *outPeerCount) {
+    if (!trackerHost || !trackerPort || !fileName || !outTotalSizeBytes || !outChunkSizeBytes || !outPeers || !outPeerCount) return -1;
+
+    *outTotalSizeBytes = 0;
+    *outChunkSizeBytes = 0;
+    *outPeerCount = 0;
+
+    int fd = protoConnectTcp(trackerHost, trackerPort);
+    if (fd < 0) return -1;
+
+    char queryLine[PROTO_MAX_LINE];
+    int queryBytes = protoBuildQuery(queryLine, sizeof queryLine, fileName);
+    if (queryBytes < 0 || protoWriteAll(fd, queryLine, (size_t)queryBytes) != 0) { close(fd); return -1; }
+
+    char line[PROTO_MAX_LINE];
+    if (protoReadLine(fd, line, sizeof line) <= 0) { close(fd); return -1; }
+
+    ProtoMsg hdr;
+    if (protoParseLine(line, &hdr) != 0) { close(fd); return -1; }
+    if (hdr.type == PROTO_MSG_ERR) {
+        close(fd);
+        return -2; // not found / other error
+    }
+    if (hdr.type != PROTO_MSG_PEERS) { close(fd); return -1; }
+
+    int advertisedPeerCount = hdr.as.peers.peerCount;
+    *outTotalSizeBytes = hdr.as.peers.totalSizeBytes;
+    *outChunkSizeBytes = hdr.as.peers.chunkSizeBytes;
+
+    size_t chunkCount = (*outTotalSizeBytes + *outChunkSizeBytes - 1) / *outChunkSizeBytes;
+    size_t bitfieldBytes = protoBitmapByteCount(chunkCount);
+
+    int count = 0;
+    for (int i = 0; i < advertisedPeerCount && i < MAX_PEERS; i++) {
+        if (protoReadLine(fd, line, sizeof line) <= 0) break;
+        ProtoMsg row;
+        if (protoParseLine(line, &row) != 0 || row.type != PROTO_MSG_PEER) continue;
+
+        SeedPeer *peer = &outPeers[count++];
+        memset(peer, 0, sizeof *peer);
+        strncpy(peer->ip, row.as.peer.ip, sizeof(peer->ip) - 1);
+        peer->port = row.as.peer.port;
+
+        peer->bitfieldBytes = bitfieldBytes;
+        peer->bitfield = (uint8_t*)calloc(bitfieldBytes ? bitfieldBytes : 1, 1);
+        if (!peer->bitfield) { close(fd); return -1; }
+
+        if (protoHexDecode(row.as.peer.bitfieldHex, peer->bitfield, bitfieldBytes) != 0) {
+            close(fd);
+            return -1;
+        }
+    }
+
+    close(fd);
+    *outPeerCount = count;
+    return 0;
+}
+
+static void freeSeedPeers(SeedPeer *peers, int peerCount) {
+    for (int i = 0; i < peerCount; i++) {
+        free(peers[i].bitfield);
+        peers[i].bitfield = NULL;
+    }
+}
+
+static int verifySeedAgainstExistingPeers(const char *filePath,
+                                         const char *fileName,
+                                         size_t totalSizeBytes,
+                                         size_t chunkSizeBytes,
+                                         const uint8_t *haveBitfield,
+                                         const SeedPeer *peers,
+                                         int peerCount) {
+    if (!filePath || !fileName || !haveBitfield || !peers) return 0;
+    if (peerCount <= 0) return 0;
+
+    size_t chunkCount = (totalSizeBytes + chunkSizeBytes - 1) / chunkSizeBytes;
+
+    int verified = 0;
+    int attempts = 0;
+    while (verified < 3 && attempts < 50) {
+        attempts++;
+
+        int p = rand() % peerCount;
+        const SeedPeer *peer = &peers[p];
+        if (!peer->bitfield) continue;
+
+        size_t start = (size_t)(rand() % (chunkCount ? chunkCount : 1));
+        size_t chosen = (size_t)-1;
+        for (size_t i = 0; i < chunkCount; i++) {
+            size_t idx = (start + i) % chunkCount;
+            if (!protoBitmapGet(haveBitfield, idx)) continue;
+            if (!protoBitmapGet(peer->bitfield, idx)) continue;
+            chosen = idx;
+            break;
+        }
+        if (chosen == (size_t)-1) continue;
+
+        char localHex[65];
+        char remoteHex[65];
+        if (computeChunkHashHex(filePath, totalSizeBytes, chunkSizeBytes, chosen, localHex) != 0) continue;
+        if (requestRemoteChunkHash(peer->ip, peer->port, fileName, chosen, chunkSizeBytes, remoteHex) != 0) continue;
+
+        if (strcmp(localHex, remoteHex) != 0) {
+            protoLog("peer", "SEED rejected: content mismatch file=%s chunk=%zu peer=%s:%d",
+                     fileName, chosen, peer->ip, peer->port);
+            return -1;
+        }
+
+        verified++;
+    }
+
+    if (verified > 0) {
+        protoLog("peer", "SEED verified: matched %d chunk hashes", verified);
+    }
+    return 0;
 }
 
 // queryTracker - send QUERY to tracker then read peers list and save it into job
@@ -199,21 +426,38 @@ static int serveOne(int clientFd, const char *dataDir) {
     if (protoReadLine(clientFd, line, sizeof line) <= 0) return -1;
 
     ProtoMsg req;
-    if (protoParseLine(line, &req) != 0 || req.type != PROTO_MSG_GET) {
-        protoWriteAll(clientFd, "ERR bad_get\n", 12);
+    if (protoParseLine(line, &req) != 0) {
+        protoWriteAll(clientFd, "ERR bad_request\n", 16);
         return -1;
     }
 
-    const char *fileName = req.as.get.fileName;
-    size_t chunkIndex = req.as.get.chunkIndex;
-    size_t chunkSizeBytes = req.as.get.chunkSizeBytes ? req.as.get.chunkSizeBytes : (size_t)PROTO_CHUNK_SIZE;
+    const char *fileName = NULL;
+    size_t chunkIndex = 0;
+    size_t chunkSizeBytes = 0;
+
+    int wantData = 0;
+    int wantHash = 0;
+    if (req.type == PROTO_MSG_GET) {
+        wantData = 1;
+        fileName = req.as.get.fileName;
+        chunkIndex = req.as.get.chunkIndex;
+        chunkSizeBytes = req.as.get.chunkSizeBytes ? req.as.get.chunkSizeBytes : (size_t)PROTO_CHUNK_SIZE;
+    } else if (req.type == PROTO_MSG_HASH_REQ) {
+        wantHash = 1;
+        fileName = req.as.hashReq.fileName;
+        chunkIndex = req.as.hashReq.chunkIndex;
+        chunkSizeBytes = req.as.hashReq.chunkSizeBytes;
+    } else {
+        protoWriteAll(clientFd, "ERR bad_request\n", 16);
+        return -1;
+    }
 
     if (chunkSizeBytes == 0) {
         protoWriteAll(clientFd, "ERR bad_get\n", 12);
         return -1;
     }
 
-    protoLog("peer", "serve: GET file=%s chunk=%zu chunk_size=%zu", fileName, chunkIndex, chunkSizeBytes);
+    protoLog("peer", "serve: %s file=%s chunk=%zu chunk_size=%zu", wantHash ? "HASH" : "GET", fileName, chunkIndex, chunkSizeBytes);
 
     char path[768];
     snprintf(path, sizeof path, "%s/%s", dataDir, fileName);
@@ -232,6 +476,22 @@ static int serveOne(int clientFd, const char *dataDir) {
 
     size_t bytesRead = fread(buf, 1, chunkSizeBytes, f);
     fclose(f);
+
+    if (wantHash && bytesRead == 0) {
+        free(buf);
+        protoWriteAll(clientFd, "ERR seek\n", 9);
+        return -1;
+    }
+
+    if (wantHash) {
+        char hex[65];
+        if (protoSha256Hex(buf, bytesRead, hex) != 0) { free(buf); protoWriteAll(clientFd, "ERR oom\n", 8); return -1; }
+        char resp[128];
+        int respBytes = protoBuildHashResp(resp, sizeof resp, chunkIndex, hex);
+        if (respBytes < 0 || protoWriteAll(clientFd, resp, (size_t)respBytes) != 0) { free(buf); return -1; }
+        free(buf);
+        return 0;
+    }
 
     protoLog("peer", "serve: DATA nbytes=%zu file=%s chunk=%zu", bytesRead, fileName, chunkIndex);
 
@@ -313,6 +573,14 @@ static int fetchChunk(DownloadJob *job, size_t chunkIndex, SeedPeer *peer, FILE 
     }
 
     // step 3 write to output file and mark chunk as done
+    uint8_t *resumeSnapshot = NULL;
+    size_t resumeSnapshotBytes = 0;
+    size_t resumeTotal = 0;
+    size_t resumeChunk = 0;
+    size_t resumeCount = 0;
+    char resumePath[768];
+    resumePath[0] = 0;
+
     pthread_mutex_lock(&job->mutex);
 
     if (protoBitmapGet(job->haveBitfield, chunkIndex)) {
@@ -330,7 +598,30 @@ static int fetchChunk(DownloadJob *job, size_t chunkIndex, SeedPeer *peer, FILE 
     peer->chunksSent += 1;
     peer->bytesSent += receivedBytes;
 
+    // Snapshot resume bitmap at most once per second.
+    time_t now = time(NULL);
+    if (job->resumePath[0] && (job->lastResumeSave == 0 || now - job->lastResumeSave >= 1)) {
+        job->lastResumeSave = now;
+        resumeSnapshotBytes = protoBitmapByteCount(job->chunkCount);
+        resumeSnapshot = (uint8_t*)malloc(resumeSnapshotBytes ? resumeSnapshotBytes : 1);
+        if (resumeSnapshot) {
+            memcpy(resumeSnapshot, job->haveBitfield, resumeSnapshotBytes);
+            resumeTotal = job->totalSizeBytes;
+            resumeChunk = job->chunkSizeBytes;
+            resumeCount = job->chunkCount;
+            strncpy(resumePath, job->resumePath, sizeof resumePath - 1);
+            resumePath[sizeof resumePath - 1] = 0;
+        }
+    }
+
     pthread_mutex_unlock(&job->mutex);
+
+    if (resumeSnapshot && resumePath[0]) {
+        (void)protoResumeSave(resumePath, resumeTotal, resumeChunk, resumeCount, resumeSnapshot, resumeSnapshotBytes);
+        free(resumeSnapshot);
+    } else if (resumeSnapshot) {
+        free(resumeSnapshot);
+    }
 
     protoLog("peer", "fetch: chunk=%zu done nbytes=%zu", chunkIndex, receivedBytes);
     result = 0;
@@ -360,17 +651,28 @@ static const SeedPeer *pickSeedForChunk(DownloadJob *job, size_t chunkIndex, uns
 
 typedef struct { DownloadJob *job; FILE *outFile; unsigned workerId; } WorkerArgs;
 
+static unsigned nextRand(unsigned *state) {
+    // simple LCG
+    *state = (*state * 1103515245u + 12345u);
+    return *state;
+}
+
 // worker - pick next missing chunk then download it from some peer until all done or failed
 static void *worker(void *arg) {
     WorkerArgs *args = (WorkerArgs*)arg;
     DownloadJob *job = args->job;
 
+    unsigned rng = (unsigned)time(NULL) ^ (unsigned)getpid() ^ (args->workerId * 2654435761u);
+
     for (;;) {
+        if (g_stopRequested) break;
         size_t chosenChunk = (size_t)-1;
 
         // step 1 pick a chunk we dont have and mark it inflight
         pthread_mutex_lock(&job->mutex);
-        for (size_t i = 0; i < job->chunkCount; i++) {
+        size_t start = (job->chunkCount > 0) ? (size_t)(nextRand(&rng) % (unsigned)job->chunkCount) : 0;
+        for (size_t scan = 0; scan < job->chunkCount; scan++) {
+            size_t i = (start + scan) % job->chunkCount;
             if (protoBitmapGet(job->haveBitfield, i)) continue;
             if (job->inFlightBitfield && protoBitmapGet(job->inFlightBitfield, i)) continue;
 
@@ -425,6 +727,12 @@ static int cmdGet(const char *trackerHost, const char *trackerPort, const char *
 
     if (queryTracker(&job, trackerHost, trackerPort) != 0) { protoLog("peer", "GET: query failed"); return -1; }
 
+    if (buildResumePath(job.resumePath, sizeof job.resumePath, outPath) != 0) {
+        protoLog("peer", "GET: cannot build resume path");
+        return -1;
+    }
+    job.lastResumeSave = 0;
+
     // step 2 open output file and mark already have chunks if file exists
     struct stat st;
     int fileExists = (stat(outPath, &st) == 0);
@@ -434,24 +742,37 @@ static int cmdGet(const char *trackerHost, const char *trackerPort, const char *
 
     if (ftruncate(fileno(outFile), (off_t)job.totalSizeBytes) != 0) { /* best-effort */ }
 
-    if (fileExists) {
-        size_t haveSizeBytes = (size_t)st.st_size;
-        if (haveSizeBytes > job.totalSizeBytes) haveSizeBytes = job.totalSizeBytes;
-
-        size_t haveChunks = 0;
-        if (job.chunkSizeBytes) {
-            if (haveSizeBytes == job.totalSizeBytes) {
-                haveChunks = job.chunkCount;
-            } else {
-                haveChunks = haveSizeBytes / job.chunkSizeBytes; // floor: excludes partial chunk
+    // load resume bitmap if exists (supports gaps); fallback to old prefix-based inference.
+    {
+        size_t rTotal = 0, rChunk = 0, rCount = 0, rBytes = 0;
+        uint8_t *rBits = NULL;
+        if (protoResumeLoad(job.resumePath, &rTotal, &rChunk, &rCount, &rBits, &rBytes) == 0) {
+            size_t expectedBytes = protoBitmapByteCount(job.chunkCount);
+            if (rTotal == job.totalSizeBytes && rChunk == job.chunkSizeBytes && rCount == job.chunkCount && rBytes == expectedBytes) {
+                pthread_mutex_lock(&job.mutex);
+                memcpy(job.haveBitfield, rBits, expectedBytes);
+                pthread_mutex_unlock(&job.mutex);
+                protoLog("peer", "GET resume: loaded bitmap from %s", job.resumePath);
             }
+            free(rBits);
+        } else if (fileExists) {
+            size_t haveSizeBytes = (size_t)st.st_size;
+            if (haveSizeBytes > job.totalSizeBytes) haveSizeBytes = job.totalSizeBytes;
+            size_t haveChunks = 0;
+            if (job.chunkSizeBytes) {
+                if (haveSizeBytes == job.totalSizeBytes) {
+                    haveChunks = job.chunkCount;
+                } else {
+                    haveChunks = haveSizeBytes / job.chunkSizeBytes;
+                }
+            }
+            pthread_mutex_lock(&job.mutex);
+            for (size_t i = 0; i < haveChunks && i < job.chunkCount; i++) protoBitmapSet(job.haveBitfield, i);
+            pthread_mutex_unlock(&job.mutex);
+            (void)protoResumeSave(job.resumePath, job.totalSizeBytes, job.chunkSizeBytes, job.chunkCount,
+                                  job.haveBitfield, protoBitmapByteCount(job.chunkCount));
+            protoLog("peer", "GET resume: inferred prefix chunks=%zu and wrote %s", haveChunks, job.resumePath);
         }
-
-        pthread_mutex_lock(&job.mutex);
-        for (size_t i = 0; i < haveChunks && i < job.chunkCount; i++) protoBitmapSet(job.haveBitfield, i);
-        pthread_mutex_unlock(&job.mutex);
-
-        protoLog("peer", "GET resume: already_have_bytes=%zu already_have_chunks=%zu", haveSizeBytes, haveChunks);
     }
 
     // step 3 start worker threads and wait
@@ -464,6 +785,16 @@ static int cmdGet(const char *trackerHost, const char *trackerPort, const char *
         pthread_create(&threads[i], NULL, worker, &workerArgs[i]);
     }
     for (unsigned i = 0; i < WORKERS; i++) pthread_join(threads[i], NULL);
+
+    // best-effort save resume on exit (including interrupt)
+    (void)protoResumeSave(job.resumePath, job.totalSizeBytes, job.chunkSizeBytes, job.chunkCount,
+                          job.haveBitfield, protoBitmapByteCount(job.chunkCount));
+
+    if (g_stopRequested) {
+        protoLog("peer", "GET stopped by signal; resume saved: %s", job.resumePath);
+        fclose(outFile);
+        return -1;
+    }
 
     // step 4 check all chunks done and print summary
     int complete = 1;
@@ -496,10 +827,62 @@ static int cmdGet(const char *trackerHost, const char *trackerPort, const char *
 // cmdSeed - make file path then call announceToTracker
 static int cmdSeed(const char *trackerHost, const char *trackerPort, int listenPort,
                    const char *dataDir, const char *fileName, size_t fullSizeBytes) {
-    const size_t chunkSizeBytes = (size_t)PROTO_CHUNK_SIZE;
+    size_t chunkSizeBytes = (size_t)PROTO_CHUNK_SIZE;
     char path[768];
     snprintf(path, sizeof path, "%s/%s", dataDir, fileName);
-    return announceToTracker(trackerHost, trackerPort, listenPort, fileName, path, chunkSizeBytes, fullSizeBytes);
+
+    size_t localSize = 0;
+    if (getFileSizeBytes(path, &localSize) != 0) {
+        protoLog("peer", "SEED: missing file: %s", path);
+        return -1;
+    }
+
+    size_t totalSizeBytes = fullSizeBytes;
+
+    SeedPeer peers[MAX_PEERS];
+    memset(peers, 0, sizeof peers);
+    int peerCount = 0;
+
+    // If user did not provide full size, discover metadata via tracker if present.
+    if (totalSizeBytes == 0) {
+        size_t trackerTotal = 0;
+        size_t trackerChunk = 0;
+        int qrc = queryTrackerMetaAndPeers(trackerHost, trackerPort, fileName, &trackerTotal, &trackerChunk, peers, &peerCount);
+        if (qrc == 0) {
+            totalSizeBytes = trackerTotal;
+            chunkSizeBytes = trackerChunk;
+            protoLog("peer", "SEED: tracker meta file=%s full=%zu chunk=%zu peers=%d", fileName, totalSizeBytes, chunkSizeBytes, peerCount);
+        } else {
+            // new file: define meta from local file size
+            totalSizeBytes = localSize;
+            peerCount = 0;
+        }
+    }
+
+    // Build our have bitmap (resume-aware) for verification.
+    size_t chunkCount = (totalSizeBytes + chunkSizeBytes - 1) / chunkSizeBytes;
+    size_t bitfieldBytes = protoBitmapByteCount(chunkCount);
+    uint8_t *haveBits = (uint8_t*)calloc(bitfieldBytes ? bitfieldBytes : 1, 1);
+    if (!haveBits) { freeSeedPeers(peers, peerCount); return -1; }
+    if (buildBitfieldForLocalFile(path, totalSizeBytes, chunkSizeBytes, haveBits, bitfieldBytes) != 0) {
+        free(haveBits);
+        freeSeedPeers(peers, peerCount);
+        return -1;
+    }
+
+    // If tracker already has this file and we discovered meta from it, verify content using a few hashes.
+    if (fullSizeBytes == 0 && peerCount > 0) {
+        if (verifySeedAgainstExistingPeers(path, fileName, totalSizeBytes, chunkSizeBytes, haveBits, peers, peerCount) != 0) {
+            free(haveBits);
+            freeSeedPeers(peers, peerCount);
+            return -1;
+        }
+    }
+
+    free(haveBits);
+    freeSeedPeers(peers, peerCount);
+
+    return announceToTracker(trackerHost, trackerPort, listenPort, fileName, path, chunkSizeBytes, totalSizeBytes);
 }
 
 // main - read env then run serve or seed or get or default mode
@@ -514,6 +897,8 @@ int main(int argc, char **argv) {
     if (!dataDir) dataDir = "/data";
 
     if (argc >= 2 && strcmp(argv[1], "serve") == 0) {
+        signal(SIGINT, handleStopSignal);
+        signal(SIGTERM, handleStopSignal);
         const char *args[2] = { listenPort, dataDir };
         pthread_t t;
         pthread_create(&t, NULL, serveThread, (void*)args);
@@ -523,6 +908,8 @@ int main(int argc, char **argv) {
 
     if (argc >= 2 && strcmp(argv[1], "seed") == 0) {
         if (argc < 3) { fprintf(stderr, "usage: tpeer seed <file> [full_size_bytes]\n"); return 2; }
+        signal(SIGINT, handleStopSignal);
+        signal(SIGTERM, handleStopSignal);
         size_t fullSizeBytes = 0;
         if (argc >= 4) fullSizeBytes = (size_t)strtoull(argv[3], NULL, 10);
         int listenPortNumber = atoi(listenPort);
@@ -531,6 +918,8 @@ int main(int argc, char **argv) {
 
     if (argc >= 2 && strcmp(argv[1], "get") == 0) {
         if (argc < 4) { fprintf(stderr, "usage: tpeer get <file> <outpath>\n"); return 2; }
+        signal(SIGINT, handleStopSignal);
+        signal(SIGTERM, handleStopSignal);
         return cmdGet(trackerHost, trackerPort, argv[2], argv[3]) == 0 ? 0 : 1;
     }
 

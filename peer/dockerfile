@@ -9,5 +9,7 @@ RUN gcc -std=gnu11 -O2 -Wall -Wextra -pthread -o /app/tpeer \
 	/app/torrents/common/proto_net.c \
 	/app/torrents/common/proto_codec.c \
 	/app/torrents/common/proto_bitfield.c \
-	/app/torrents/common/proto_msg.c
+	/app/torrents/common/proto_msg.c \
+	/app/torrents/common/proto_resume.c \
+	/app/torrents/common/proto_sha256.c
 CMD ["/app/tpeer", "serve"]

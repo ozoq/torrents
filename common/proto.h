@@ -7,3 +7,5 @@
 #include "proto_codec.h"
 #include "proto_bitfield.h"
 #include "proto_msg.h"
+#include "proto_resume.h"
+#include "proto_sha256.h"

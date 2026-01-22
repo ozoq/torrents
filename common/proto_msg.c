@@ -126,6 +126,25 @@ int protoParseLine(char *line, ProtoMsg *out) {
         return 0;
     }
 
+    if (strcmp(cmd, "HASH") == 0) {
+        // Request:  HASH <file_name> <chunk_index> <chunk_size_bytes>
+        // Response: HASH <chunk_index> <sha256_hex>
+        if (n == 4) {
+            out->type = PROTO_MSG_HASH_REQ;
+            out->as.hashReq.fileName = tokens[1];
+            if (parseSize(tokens[2], &out->as.hashReq.chunkIndex) != 0) return -1;
+            if (parseSize(tokens[3], &out->as.hashReq.chunkSizeBytes) != 0) return -1;
+            return 0;
+        }
+        if (n == 3) {
+            out->type = PROTO_MSG_HASH;
+            if (parseSize(tokens[1], &out->as.hash.chunkIndex) != 0) return -1;
+            out->as.hash.sha256Hex = tokens[2];
+            return 0;
+        }
+        return -1;
+    }
+
     return -1;
 }
 
@@ -164,6 +183,17 @@ int protoBuildGet(char *out, size_t outSize, const char *fileName, size_t chunkI
 
 int protoBuildDataHeader(char *out, size_t outSize, size_t byteCount) {
     int n = snprintf(out, outSize, "DATA %zu\n", byteCount);
+    return (n < 0 || (size_t)n >= outSize) ? -1 : n;
+}
+
+int protoBuildHashReq(char *out, size_t outSize, const char *fileName, size_t chunkIndex, size_t chunkSizeBytes) {
+    int n = snprintf(out, outSize, "HASH %s %zu %zu\n", fileName, chunkIndex, chunkSizeBytes);
+    return (n < 0 || (size_t)n >= outSize) ? -1 : n;
+}
+
+int protoBuildHashResp(char *out, size_t outSize, size_t chunkIndex, const char *sha256Hex) {
+    if (!sha256Hex) sha256Hex = "";
+    int n = snprintf(out, outSize, "HASH %zu %s\n", chunkIndex, sha256Hex);
     return (n < 0 || (size_t)n >= outSize) ? -1 : n;
 }
 

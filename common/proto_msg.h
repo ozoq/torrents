@@ -9,6 +9,8 @@ typedef enum {
     PROTO_MSG_PEER,
     PROTO_MSG_GET,
     PROTO_MSG_DATA,
+    PROTO_MSG_HASH_REQ,
+    PROTO_MSG_HASH,
     PROTO_MSG_OK,
     PROTO_MSG_ERR,
 } ProtoMsgType;
@@ -54,6 +56,17 @@ typedef struct {
         } data;
 
         struct {
+            const char *fileName;
+            size_t chunkIndex;
+            size_t chunkSizeBytes;
+        } hashReq;
+
+        struct {
+            size_t chunkIndex;
+            const char *sha256Hex;
+        } hash;
+
+        struct {
             const char *reason;
         } err;
     } as;
@@ -70,5 +83,7 @@ int protoBuildPeersHeader(char *out, size_t outSize, const char *fileName,
 int protoBuildPeerRow(char *out, size_t outSize, const char *ip, int port, const char *bitfieldHex);
 int protoBuildGet(char *out, size_t outSize, const char *fileName, size_t chunkIndex, size_t chunkSizeBytes);
 int protoBuildDataHeader(char *out, size_t outSize, size_t byteCount);
+int protoBuildHashReq(char *out, size_t outSize, const char *fileName, size_t chunkIndex, size_t chunkSizeBytes);
+int protoBuildHashResp(char *out, size_t outSize, size_t chunkIndex, const char *sha256Hex);
 int protoBuildOk(char *out, size_t outSize);
 int protoBuildErr(char *out, size_t outSize, const char *reason);
